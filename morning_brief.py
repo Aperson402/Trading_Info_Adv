@@ -40,6 +40,12 @@ RSI: {gold_rsi} | ATR: {gold_atr}
 Signal: {gold_signal} {gold_grade}
 {gold_sl_tp}
 
+US DOLLAR INDEX (DXY) — {dxy_price} ({dxy_change:+.2f}% today)
+Trend: {dxy_trend} vs SMA20 ({dxy_sma20}) — Gold implication: {dxy_implication}
+
+24-HOUR SENTIMENT WINDOW:
+{sentiment}
+
 COT POSITIONING (latest CFTC report):
 {cot_oil}
 {cot_gold}
@@ -105,17 +111,39 @@ def _fmt_cot(cot, instrument: str) -> str:
     )
 
 
-def _build_prompt(items, oil_ctx, gold_ctx, cot_data=None, calendar_events=None) -> str:
+def _fmt_sentiment(sentiment: dict) -> str:
+    lines = []
+    for inst in ("oil", "gold"):
+        s = sentiment.get(inst, {})
+        total = s.get("total", 0)
+        if total == 0:
+            lines.append(f"{inst.upper()}: no classified items in last 24h")
+            continue
+        bull = s.get("bullish", 0)
+        bear = s.get("bearish", 0)
+        neut = s.get("neutral", 0)
+        dominant = max(("bullish", bull), ("bearish", bear), ("neutral", neut), key=lambda x: x[1])[0]
+        lines.append(
+            f"{inst.upper()}: {bull} bullish / {bear} bearish / {neut} neutral "
+            f"({total} total) — dominant: {dominant.upper()}"
+        )
+    return "\n".join(lines)
+
+
+def _build_prompt(items, oil_ctx, gold_ctx, cot_data=None, calendar_events=None, sentiment=None, dxy_ctx=None) -> str:
     def g(ctx, key, default="n/a"):
         v = ctx.get(key, default)
         return v if v is not None else default
 
     cot_data = cot_data or {}
+    dxy_ctx  = dxy_ctx  or {}
     cal_str  = fmt_calendar_for_brief(calendar_events or [])
+    sent_str = _fmt_sentiment(sentiment or {})
 
     return MORNING_BRIEF_PROMPT.format(
         n_items=len(items),
         items_text=_fmt_items(items),
+        sentiment=sent_str,
         oil_price=g(oil_ctx, "price"),
         oil_regime=g(oil_ctx, "regime"),
         oil_bias=g(oil_ctx, "bias"),
@@ -140,6 +168,11 @@ def _build_prompt(items, oil_ctx, gold_ctx, cot_data=None, calendar_events=None)
         gold_signal=g(gold_ctx, "signal", "NONE"),
         gold_grade=g(gold_ctx, "signal_grade", ""),
         gold_sl_tp=_fmt_sl_tp(gold_ctx),
+        dxy_price=dxy_ctx.get("price", "n/a"),
+        dxy_change=dxy_ctx.get("change_pct", 0.0),
+        dxy_trend=dxy_ctx.get("trend", "n/a"),
+        dxy_sma20=dxy_ctx.get("sma20", "n/a"),
+        dxy_implication=dxy_ctx.get("gold_implication", "n/a"),
         cot_oil=_fmt_cot(cot_data.get("oil"),  "oil"),
         cot_gold=_fmt_cot(cot_data.get("gold"), "gold"),
         calendar=cal_str,
@@ -152,9 +185,11 @@ async def generate_morning_brief(
     gold_ctx: dict,
     cot_data: dict = None,
     calendar_events: list = None,
+    sentiment: dict = None,
+    dxy_ctx: dict = None,
 ) -> str:
     client = anthropic.AsyncAnthropic()
-    prompt = _build_prompt(items, oil_ctx, gold_ctx, cot_data, calendar_events)
+    prompt = _build_prompt(items, oil_ctx, gold_ctx, cot_data, calendar_events, sentiment, dxy_ctx)
 
     try:
         response = await client.messages.create(

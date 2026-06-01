@@ -18,6 +18,8 @@ from typing import Optional
 
 import anthropic
 
+from database import get_source_reliability
+
 logger = logging.getLogger(__name__)
 
 MIN_CONFIDENCE = 6  # items below this threshold are dropped even if ignore=False
@@ -139,11 +141,21 @@ async def classify_item(item: dict) -> Optional[dict]:
     confidence = int(classification.get("confidence", 0))
     ignore = bool(classification.get("ignore", False))
 
-    if ignore or confidence < MIN_CONFIDENCE:
+    if ignore:
+        logger.info("FILTERED [ignore=True] %s", item.get("title", "")[:70])
+        return None
+
+    reliability = await get_source_reliability(item.get("source_name", ""))
+    weighted_confidence = min(10, round(confidence * reliability))
+    if weighted_confidence != confidence:
         logger.info(
-            "FILTERED [ignore=%s, conf=%d] %s",
-            ignore, confidence, item.get("title", "")[:70],
+            "SOURCE WEIGHT [%s] %.2fx → conf %d→%d",
+            item.get("source_name", ""), reliability, confidence, weighted_confidence,
         )
+    confidence = weighted_confidence
+
+    if confidence < MIN_CONFIDENCE:
+        logger.info("FILTERED [conf=%d after weighting] %s", confidence, item.get("title", "")[:70])
         return None
 
     logger.info(

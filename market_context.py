@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 TICKERS = {
     "oil":  "CL=F",   # WTI Crude front-month futures
     "gold": "GC=F",   # Gold front-month futures
+    "dxy":  "DX=F",   # US Dollar Index futures
 }
 
 # ── Pine Script parameters (exact match) ─────────────────────────────────────
@@ -362,14 +363,54 @@ async def get_market_context(instrument: str) -> Optional[dict]:
     return ctx
 
 
+async def get_dxy_context() -> dict:
+    """Fetch DXY price, daily change, and trend vs 20-day SMA."""
+    loop = asyncio.get_event_loop()
+    df = await loop.run_in_executor(None, _fetch_ohlcv, TICKERS["dxy"], "1d", "30d")
+    if df is None or len(df) < 2:
+        return {}
+    price      = float(df["Close"].iloc[-1])
+    prev_close = float(df["Close"].iloc[-2])
+    change_pct = (price - prev_close) / prev_close * 100
+    sma20      = float(df["Close"].rolling(20).mean().iloc[-1])
+    trend      = "bullish" if price > sma20 else "bearish"
+    return {
+        "price":      round(price, 2),
+        "change_pct": round(change_pct, 2),
+        "trend":      trend,
+        "sma20":      round(sma20, 2),
+        "gold_implication": "headwind" if trend == "bullish" else "tailwind",
+    }
+
+
+async def get_current_prices() -> dict:
+    """Lightweight price-only fetch — used for 1-minute price alert checks."""
+    loop = asyncio.get_event_loop()
+
+    def _price(ticker: str) -> Optional[float]:
+        try:
+            p = yf.Ticker(ticker).fast_info.last_price
+            return float(p) if p else None
+        except Exception:
+            return None
+
+    oil, gold = await asyncio.gather(
+        loop.run_in_executor(None, _price, TICKERS["oil"]),
+        loop.run_in_executor(None, _price, TICKERS["gold"]),
+    )
+    return {"oil": oil, "gold": gold}
+
+
 async def get_both_contexts() -> dict:
-    """Fetch oil and gold contexts concurrently."""
-    oil_ctx, gold_ctx = await asyncio.gather(
+    """Fetch oil, gold, and DXY contexts concurrently."""
+    oil_ctx, gold_ctx, dxy_ctx = await asyncio.gather(
         get_market_context("oil"),
         get_market_context("gold"),
+        get_dxy_context(),
         return_exceptions=True,
     )
     return {
         "oil":  oil_ctx  if not isinstance(oil_ctx,  Exception) else None,
         "gold": gold_ctx if not isinstance(gold_ctx, Exception) else None,
+        "dxy":  dxy_ctx  if not isinstance(dxy_ctx,  Exception) else {},
     }

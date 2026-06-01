@@ -1,6 +1,6 @@
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiosqlite
@@ -46,6 +46,22 @@ async def init_db() -> None:
                 await db.execute(f"ALTER TABLE seen_items ADD COLUMN {col} {coltype}")
             except Exception:
                 pass  # column already exists
+        await db.commit()
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                instrument  TEXT NOT NULL,
+                direction   TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                sl_price    REAL,
+                tp_price    REAL,
+                opened_at   TEXT NOT NULL,
+                closed_at   TEXT,
+                close_price REAL,
+                outcome     TEXT,
+                pnl_pct     REAL
+            )
+        """)
         await db.commit()
     logger.info("Database initialised at %s", DATABASE_PATH)
 
@@ -109,6 +125,68 @@ async def update_classification(url: str, classification: dict) -> None:
         await db.commit()
 
 
+async def get_sentiment_window(hours: int = 24) -> dict:
+    """
+    Return bullish/bearish/neutral counts for oil and gold over the last N hours.
+    Only counts classified, non-ignored items.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    result = {
+        "oil":  {"bullish": 0, "bearish": 0, "neutral": 0, "total": 0},
+        "gold": {"bullish": 0, "bearish": 0, "neutral": 0, "total": 0},
+    }
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT instrument, direction, COUNT(*) as cnt
+            FROM seen_items
+            WHERE discovered_at >= ?
+              AND ignored = 0
+              AND confidence IS NOT NULL
+              AND direction IN ('bullish', 'bearish', 'neutral')
+              AND instrument IN ('oil', 'gold', 'both')
+            GROUP BY instrument, direction
+            """,
+            (since,),
+        )
+        rows = await cursor.fetchall()
+
+    for instrument, direction, cnt in rows:
+        targets = ["oil", "gold"] if instrument == "both" else [instrument]
+        for t in targets:
+            result[t][direction] += cnt
+            result[t]["total"] += cnt
+
+    return result
+
+
+async def get_source_reliability(source_name: str) -> float:
+    """
+    Return a confidence multiplier (0.7–1.3) based on historical signal rate.
+    Signal rate = items with confidence >= 6 / total classified items for this source.
+    Falls back to 1.0 if fewer than 5 classified items exist.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN confidence >= 6 THEN 1 ELSE 0 END) as actionable
+            FROM seen_items
+            WHERE source_name = ? AND confidence IS NOT NULL
+            """,
+            (source_name,),
+        )
+        row = await cursor.fetchone()
+
+    if not row or row[0] < 5:
+        return 1.0  # not enough history
+
+    total, actionable = row
+    signal_rate = actionable / total
+    return round(0.7 + 0.6 * signal_rate, 3)  # [0.7, 1.3]
+
+
 async def get_items_since(since: datetime) -> list[dict]:
     """Return all items discovered on or after *since* (UTC-aware datetime)."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -122,6 +200,76 @@ async def get_items_since(since: datetime) -> list[dict]:
             ORDER BY discovered_at ASC
             """,
             (since.isoformat(),),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def open_trade(
+    instrument: str,
+    direction: str,
+    entry_price: float,
+    sl_price: Optional[float] = None,
+    tp_price: Optional[float] = None,
+) -> dict:
+    opened_at = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO trades (instrument, direction, entry_price, sl_price, tp_price, opened_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (instrument, direction, entry_price, sl_price, tp_price, opened_at),
+        )
+        trade_id = cursor.lastrowid
+        await db.commit()
+    return {
+        "id": trade_id, "instrument": instrument, "direction": direction,
+        "entry_price": entry_price, "sl_price": sl_price, "tp_price": tp_price,
+        "opened_at": opened_at,
+    }
+
+
+async def get_open_trades() -> list[dict]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE closed_at IS NULL ORDER BY opened_at ASC"
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def close_trade(trade_id: int, close_price: float, outcome: str) -> dict:
+    closed_at = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
+        trade = dict(await cursor.fetchone())
+
+    entry = trade["entry_price"]
+    if trade["direction"] == "long":
+        pnl_pct = (close_price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - close_price) / entry * 100
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE trades SET closed_at=?, close_price=?, outcome=?, pnl_pct=? WHERE id=?",
+            (closed_at, close_price, outcome, round(pnl_pct, 3), trade_id),
+        )
+        await db.commit()
+
+    return {**trade, "closed_at": closed_at, "close_price": close_price,
+            "outcome": outcome, "pnl_pct": round(pnl_pct, 3)}
+
+
+async def get_recent_trades(limit: int = 5) -> list[dict]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT ?",
+            (limit,),
         )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]

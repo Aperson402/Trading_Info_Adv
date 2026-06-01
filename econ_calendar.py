@@ -5,6 +5,7 @@ Uses jblanked.com free API (ForexFactory data, clean JSON, no auth).
 Filters for high-impact USD events and commodity-relevant releases.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -13,7 +14,8 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-CALENDAR_API = "https://www.jblanked.com/news/api/forex-factory/calendar/range/"
+FF_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+FF_NEXTWEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
 
 # High-impact events relevant to oil and gold trading
 RELEVANT_EVENTS = {
@@ -64,6 +66,7 @@ def _parse_event(raw: dict) -> Optional[dict]:
             "time_str": time_str or (dt.strftime("%H:%M UTC") if dt else "TBD"),
             "forecast": forecast,
             "previous": previous,
+            "actual":   raw.get("actual") or "",
         }
     except Exception:
         return None
@@ -71,43 +74,50 @@ def _parse_event(raw: dict) -> Optional[dict]:
 
 async def get_week_calendar() -> list[dict]:
     """
-    Fetch high-impact economic events for the next 7 days.
-    Returns list of relevant events sorted by datetime.
+    Fetch high-impact economic events for the next 7 days from ForexFactory.
+    Fetches both this week and next week feeds to ensure full 7-day coverage.
     """
-    now   = datetime.now(timezone.utc)
-    end   = now + timedelta(days=7)
-    from_str = now.strftime("%Y-%m-%d")
-    to_str   = end.strftime("%Y-%m-%d")
-
-    params = {
-        "from":     from_str,
-        "to":       to_str,
-        "currency": "USD",
-        "impact":   "High",
-    }
-
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=7)
     timeout = aiohttp.ClientTimeout(total=15)
     events: list[dict] = []
 
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(CALENDAR_API, params=params, ssl=True) as resp:
-                resp.raise_for_status()
-                raw_events = await resp.json()
+    async def _fetch(url: str) -> list:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, ssl=True) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+        except Exception as exc:
+            logger.warning("Calendar fetch failed (%s): %s", url, exc)
+            return []
 
+    raw_all = await asyncio.gather(_fetch(FF_THISWEEK), _fetch(FF_NEXTWEEK))
+
+    for raw_events in raw_all:
         for raw in raw_events:
+            if (raw.get("country") != "USD") or (raw.get("impact") != "High"):
+                continue
             event = _parse_event(raw)
-            if event and _is_relevant(event["title"]):
+            if not event or not event["datetime"]:
+                continue
+            if event["datetime"] < now or event["datetime"] > cutoff:
+                continue
+            if _is_relevant(event["title"]):
                 events.append(event)
 
-        # Sort by datetime
-        events.sort(key=lambda e: e["datetime"] or datetime.max.replace(tzinfo=timezone.utc))
-        logger.info("Calendar: %d relevant high-impact events in next 7 days", len(events))
+    events.sort(key=lambda e: e["datetime"])
+    # Deduplicate by title+datetime
+    seen: set = set()
+    unique = []
+    for e in events:
+        key = (e["title"], e["datetime"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
 
-    except Exception as exc:
-        logger.warning("Calendar fetch failed: %s", exc)
-
-    return events
+    logger.info("Calendar: %d relevant high-impact USD events in next 7 days", len(unique))
+    return unique
 
 
 def fmt_calendar_for_brief(events: list[dict]) -> str:

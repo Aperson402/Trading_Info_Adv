@@ -191,6 +191,158 @@ async def send_morning_brief(
     await _send(bot, message)
 
 
+async def send_trade_opened(trade: dict) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    emoji = "🛢" if trade["instrument"] == "oil" else "🥇"
+    direction = trade["direction"].upper()
+    sl = f"  SL: ${trade['sl_price']:,.2f}" if trade.get("sl_price") else ""
+    tp = f"  TP: ${trade['tp_price']:,.2f}" if trade.get("tp_price") else ""
+    await _send(bot,
+        f"{emoji} <b>TRADE OPENED — {direction} {trade['instrument'].upper()}</b>\n"
+        f"Entry: <b>${trade['entry_price']:,.2f}</b>{sl}{tp}"
+    )
+
+
+async def send_trade_closed(trade: dict) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    emoji = "🛢" if trade["instrument"] == "oil" else "🥇"
+    pnl = trade.get("pnl_pct", 0)
+    outcome = trade.get("outcome", "manual")
+    result_emoji = "✅" if pnl >= 0 else "❌"
+    opened = datetime.fromisoformat(trade["opened_at"]).replace(tzinfo=timezone.utc)
+    closed = datetime.fromisoformat(trade["closed_at"]).replace(tzinfo=timezone.utc)
+    duration = closed - opened
+    hours, rem = divmod(int(duration.total_seconds()), 3600)
+    mins = rem // 60
+    duration_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+    await _send(bot,
+        f"{result_emoji}{emoji} <b>TRADE CLOSED — {trade['direction'].upper()} {trade['instrument'].upper()}</b>\n"
+        f"Entry: ${trade['entry_price']:,.2f} → Exit: ${trade['close_price']:,.2f}  ({_h(outcome)})\n"
+        f"P&amp;L: <b>{pnl:+.2f}%</b>  |  Duration: {duration_str}"
+    )
+
+
+async def send_trades_list(open_trades: list[dict], recent_trades: list[dict], current_prices: dict) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    lines = ["📋 <b>TRADE JOURNAL</b>"]
+
+    if open_trades:
+        lines.append("\n<b>Open:</b>")
+        for t in open_trades:
+            emoji = "🛢" if t["instrument"] == "oil" else "🥇"
+            cur = current_prices.get(t["instrument"])
+            if cur:
+                pnl = (cur - t["entry_price"]) / t["entry_price"] * 100
+                if t["direction"] == "short":
+                    pnl = -pnl
+                pnl_str = f"  P&amp;L: {pnl:+.2f}%"
+            else:
+                pnl_str = ""
+            sl = f"  SL ${t['sl_price']:,.2f}" if t.get("sl_price") else ""
+            tp = f"  TP ${t['tp_price']:,.2f}" if t.get("tp_price") else ""
+            lines.append(f"{emoji} {t['direction'].upper()} @ ${t['entry_price']:,.2f}{sl}{tp}{pnl_str}")
+    else:
+        lines.append("\n<i>No open trades.</i>")
+
+    if recent_trades:
+        lines.append("\n<b>Recent closed:</b>")
+        for t in recent_trades:
+            emoji = "🛢" if t["instrument"] == "oil" else "🥇"
+            result = "✅" if (t.get("pnl_pct") or 0) >= 0 else "❌"
+            lines.append(
+                f"{result} {emoji} {t['direction'].upper()} {t['instrument'].upper()} "
+                f"${t['entry_price']:,.2f}→${t['close_price']:,.2f}  "
+                f"<b>{(t.get('pnl_pct') or 0):+.2f}%</b>"
+            )
+
+    await _send(bot, "\n".join(lines))
+
+
+async def send_price_alert(instrument: str, price: float, target: float, direction: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    emoji = "🛢" if instrument == "oil" else "🥇"
+    crossed = "above" if direction == "above" else "below"
+    message = (
+        f"{emoji} <b>PRICE ALERT — {instrument.upper()}</b>\n"
+        f"Price <b>${price:,.2f}</b> crossed {crossed} your target of <b>${target:,.2f}</b>"
+    )
+    await _send(bot, message)
+
+
+async def send_advice(advice_text: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    header = f"🎯 <b>ADVICE — {_h(now_str)}</b>"
+    message = f"{header}\n\n{_h(advice_text)}"
+    await _send(bot, message)
+
+
+async def send_event_alert(event: dict, kind: str = "upcoming") -> None:
+    """Send a pre-event warning or post-event result alert."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    title = _h(event.get("title", ""))
+    dt = event.get("datetime")
+    when = dt.strftime("%H:%M UTC") if dt else "—"
+    forecast = event.get("forecast", "")
+    previous = event.get("previous", "")
+    actual   = event.get("actual", "")
+
+    if kind == "upcoming":
+        lines = [f"⏰ <b>UPCOMING — {title}</b>  {when}"]
+        if forecast: lines.append(f"Forecast: <b>{_h(forecast)}</b>")
+        if previous: lines.append(f"Previous: {_h(previous)}")
+    else:
+        beat = ""
+        try:
+            if actual and forecast:
+                a, f = float(actual.replace("%","").replace("K","000").replace("M","000000")), \
+                       float(forecast.replace("%","").replace("K","000").replace("M","000000"))
+                beat = "  ✅ <b>BEAT</b>" if a > f else "  ❌ <b>MISS</b>" if a < f else "  ➡️ <b>IN LINE</b>"
+        except Exception:
+            pass
+        lines = [f"📊 <b>RESULT — {title}</b>{beat}"]
+        if actual:   lines.append(f"Actual: <b>{_h(actual)}</b>")
+        if forecast: lines.append(f"Forecast: {_h(forecast)}")
+        if previous: lines.append(f"Previous: {_h(previous)}")
+
+    await _send(bot, "\n".join(lines))
+
+
+async def send_calendar(events: list[dict]) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    today_str = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
+    header = f"📅 <b>ECONOMIC CALENDAR — {_h(today_str)}</b>\n<i>High-impact USD events, next 7 days</i>"
+
+    if not events:
+        await _send(bot, f"{header}\n\n<i>No high-impact events in the next 7 days.</i>")
+        return
+
+    lines = []
+    for e in events:
+        dt = e.get("datetime")
+        when = dt.strftime("%a %d %b %H:%M UTC") if dt else e.get("time_str", "TBD")
+        forecast = f"  f: {e['forecast']}" if e.get("forecast") else ""
+        previous = f"  prev: {e['previous']}" if e.get("previous") else ""
+        lines.append(f"• <b>{_h(when)}</b>  {_h(e['title'])}{_h(forecast)}{_h(previous)}")
+
+    message = f"{header}\n\n" + "\n".join(lines)
+    await _send(bot, message)
+
+
 async def send_cot_update(cot_data: dict) -> None:
     """Send Friday COT positioning summary."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:

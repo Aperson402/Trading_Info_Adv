@@ -468,6 +468,24 @@ async def fetch_worldoil(session: aiohttp.ClientSession) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Source 8 — CNBC Energy RSS
+# ---------------------------------------------------------------------------
+
+async def fetch_cnbc(session: aiohttp.ClientSession) -> list[dict]:
+    """
+    CNBC Energy section RSS — breaking oil, gas, and commodity market news.
+    Replaces dead Reuters feeds.reuters.com (domain no longer resolves).
+    """
+    return await _process_rss_feed(
+        session,
+        "https://www.cnbc.com/id/19836768/device/rss/rss.html",
+        "CNBC Energy",
+        max_new=10,
+        filter_fn=_is_relevant,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -479,4 +497,5 @@ ALL_SOURCES = [
     fetch_ft,
     fetch_ap,
     fetch_worldoil,
+    fetch_cnbc,
 ]
