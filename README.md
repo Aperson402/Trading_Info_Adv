@@ -1,135 +1,140 @@
-# Trading Intel Agent — Phase 1
+# Trading Intel Agent
 
-Async Python system that monitors primary sources for oil and gold trading
-intelligence and delivers alerts via Telegram.
+Async Python system that monitors 8 news sources every 3 minutes for oil and gold trading intelligence, classifies each item with Claude, and delivers real-time alerts plus a daily morning brief via Telegram.
+
+## What it does
+
+- **Monitors** 8 sources concurrently every 3 minutes — RSS feeds, HTML scrapes, government releases
+- **Classifies** every new item using Claude Haiku: instrument (oil/gold/both/neither), direction (bullish/bearish/neutral), urgency, confidence 1–10, one-line reasoning
+- **Weights** classifier confidence by source reliability (historical signal rate builds over time)
+- **Tracks** 24-hour sentiment ratios per instrument (e.g. 8/10 bearish oil = different environment than 5/5)
+- **Delivers** enriched Telegram alerts with live market context (price, BB, Stoch, RSI, regime)
+- **Generates** a daily Claude Sonnet morning brief synthesising news + technicals + COT + DXY + sentiment + economic calendar
+- **Alerts** before and after high-impact economic events (forecast → actual with beat/miss)
+- **Monitors** price levels every minute and fires alerts when crossed
+- **Tracks** trades with auto-close on SL/TP and P&L history
 
 ## Architecture
 
 ```
-trading-intel/
-├── main.py          # Entry point, scheduler setup
-├── monitor.py       # Runs all sources concurrently
-├── sources.py       # One async function per data source
-├── telegram_bot.py  # Message formatting and Telegram delivery
-├── database.py      # SQLite deduplication via aiosqlite
-├── config.py        # Env-var config
-├── requirements.txt
-├── .env.example
-└── README.md
+├── main.py           — Entry point, scheduler, Telegram command polling
+├── monitor.py        — Runs all sources concurrently
+├── sources.py        — One async function per data source
+├── classifier.py     — Claude Haiku relevance + direction classifier
+├── market_context.py — Live price, BB, Stoch, RSI, regime, DXY via yfinance
+├── morning_brief.py  — Claude Sonnet daily synthesis
+├── advice.py         — Claude Sonnet on-demand real-time advice
+├── telegram_bot.py   — Message formatting and Telegram delivery
+├── database.py       — SQLite via aiosqlite (items, trades, sentiment)
+├── cot.py            — CFTC COT positioning data
+├── econ_calendar.py  — ForexFactory economic calendar
+├── config.py         — Env-var configuration
+└── requirements.txt
 ```
 
 ## Sources monitored
 
-| Source | Method |
+| Source | Method | Frequency |
+|---|---|---|
+| CNBC Energy | RSS | Every 3 min |
+| OilPrice.com | RSS | Every 3 min |
+| Financial Times | RSS | Every 3 min |
+| AP News Energy | HTML scrape | Every 3 min |
+| World Oil | RSS | Every 3 min |
+| State Dept Press Releases | HTML scrape | Every 3 min |
+| IAEA Press Releases | HTML scrape | Every 3 min |
+| EIA Weekly Petroleum Report | HTML scrape | Weekly (on publish) |
+
+## Telegram commands
+
+| Command | Description |
 |---|---|
-| EIA Petroleum Supply Weekly | HTML scrape |
-| OPEC Press Releases | HTML scrape |
-| State Dept Middle East Briefings | RSS feed |
-| IAEA Press Releases | RSS feed |
-| Reuters Business News | RSS feed |
-| AP News | RSS feed |
-| Baker Hughes Rig Count | HTML scrape |
+| `/brief` | Generate morning brief on demand |
+| `/advice` | Real-time market analysis with specific entry levels |
+| `/calendar` | High-impact USD economic events for the next 7 days |
+| `/setoil 91` | Alert when WTI crosses $91 |
+| `/setgold 2500` | Alert when gold crosses $2500 |
+| `/trade long oil 89.50 sl:88.00 tp:91.50` | Log a trade |
+| `/trades` | Open positions with live P&L + recent closed trades |
+| `/close oil` | Manually close all open oil trades at current price |
 
-## Quick start (local)
+## Quick start
 
-### 1. Prerequisites
+### Prerequisites
 
 - Python 3.11+
-- A Telegram bot token — create one via [@BotFather](https://t.me/BotFather)
-- Your Telegram chat ID — send a message to your bot then call
-  `https://api.telegram.org/bot<TOKEN>/getUpdates`
+- Telegram bot token — create via [@BotFather](https://t.me/BotFather)
+- Telegram chat ID — send a message to your bot then check `https://api.telegram.org/bot<TOKEN>/getUpdates`
+- Anthropic API key — [console.anthropic.com](https://console.anthropic.com)
 
-### 2. Install dependencies
+### Install
 
 ```bash
-cd trading-intel
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure
+### Configure
 
 ```bash
 cp .env.example .env
-# Edit .env — set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID at minimum
 ```
 
-### 4. Run
+Edit `.env`:
+
+```env
+TELEGRAM_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+ANTHROPIC_API_KEY=your_anthropic_key
+
+# Optional — defaults shown
+DATABASE_PATH=trading_intel.db
+MONITOR_INTERVAL_MINUTES=3
+MORNING_BRIEF_HOUR=6
+MORNING_BRIEF_MINUTE=45
+MORNING_BRIEF_LOOKBACK_HOURS=12
+REQUEST_TIMEOUT_SECONDS=30
+LOG_LEVEL=INFO
+```
+
+### Run
 
 ```bash
 python main.py
 ```
 
-On startup the system will:
-1. Initialise the SQLite database
-2. Run an immediate full-source monitor cycle
-3. Schedule monitor cycles every 10 minutes
-4. Schedule the morning brief at 06:45 UTC daily
-
-Logs are written to stdout. You should see output like:
-
-```
-2025-01-15 06:00:00  INFO      __main__ — === Trading Intel Agent — Phase 1 starting ===
-2025-01-15 06:00:00  INFO      database — Database initialised at trading_intel.db
-2025-01-15 06:00:00  INFO      __main__ — ▶  Monitor cycle started
-2025-01-15 06:00:02  INFO      monitor — [Reuters] returned 3 new item(s)
-2025-01-15 06:00:02  INFO      monitor — [IAEA] returned 1 new item(s)
-...
-2025-01-15 06:00:05  INFO      __main__ — Monitor cycle complete — 4 new item(s)
-```
+On startup the agent will initialise the database, run an immediate monitor cycle, and start the scheduler.
 
 ---
 
-## Deploying to Railway
+## Deployment
 
-1. Push your repo to GitHub (ensure `.env` is in `.gitignore`).
-2. Create a new Railway project → **Deploy from GitHub repo**.
-3. In **Variables**, add `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID`.
-4. Railway auto-detects Python. Set the **Start Command**:
-   ```
-   python main.py
-   ```
-5. Deploy. Railway will restart the service automatically on crashes.
+### Railway
 
-### Persistent SQLite on Railway
+1. Push repo to GitHub (confirm `.env` is in `.gitignore`)
+2. New Railway project → **Deploy from GitHub repo**
+3. Add environment variables: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `ANTHROPIC_API_KEY`
+4. Start command: `python main.py`
+5. Add a **Volume** mounted at `/data` and set `DATABASE_PATH=/data/trading_intel.db` to persist the database across deploys
 
-Railway's filesystem is ephemeral. To persist the seen-items database between
-deploys, use a Railway Volume:
+### Render
 
-1. Railway project → **Add Volume** → mount path `/data`
-2. Set env var `DATABASE_PATH=/data/trading_intel.db`
-
----
-
-## Deploying to Render
-
-1. Push repo to GitHub.
-2. Create a new **Background Worker** service (not a Web Service).
-3. Set **Build Command**: `pip install -r requirements.txt`
-4. Set **Start Command**: `python main.py`
-5. Add environment variables under **Environment**.
-6. For persistence, add a **Render Disk** and set `DATABASE_PATH` to a path
-   on that disk (e.g. `/data/trading_intel.db`).
+1. New **Background Worker** service
+2. Build command: `pip install -r requirements.txt`
+3. Start command: `python main.py`
+4. Add environment variables under **Environment**
+5. Add a **Render Disk** and set `DATABASE_PATH` to a path on that disk
 
 ---
 
-## Adding a new source
+## Adding a source
 
-1. Open `sources.py`.
-2. Write an async function `fetch_<name>(session: aiohttp.ClientSession) -> list[dict]`.
-   - Use `_process_rss_feed()` for RSS/Atom feeds.
-   - Use `_fetch_text()` + BeautifulSoup for HTML scraping.
-   - Call `await is_seen(url)` before adding an item.
-   - Call `await mark_seen(...)` after adding.
-3. Append the function to `ALL_SOURCES` at the bottom of the file.
+1. Open `sources.py`
+2. Write `async def fetch_<name>(session: aiohttp.ClientSession) -> list[dict]`
+   - Use `_process_rss_feed()` for RSS feeds
+   - Use `_fetch_text()` + BeautifulSoup for HTML scrapes
+   - Call `await is_seen(url)` before adding, `await mark_seen(...)` after
+3. Append to `ALL_SOURCES` at the bottom
 
-No changes needed anywhere else.
-
----
-
-## Phase 2 preview
-
-Phase 2 will add Claude-powered relevance classification: each new item will be
-scored for relevance to oil/gold trading, and only high-signal items will trigger
-Telegram alerts, with a synthesised summary.
+No other changes needed.
