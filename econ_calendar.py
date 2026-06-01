@@ -14,6 +14,10 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+_cache: list[dict] = []
+_cache_expires: datetime | None = None
+_CACHE_TTL = timedelta(minutes=30)
+
 FF_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 FF_NEXTWEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
 
@@ -75,9 +79,14 @@ def _parse_event(raw: dict) -> Optional[dict]:
 async def get_week_calendar() -> list[dict]:
     """
     Fetch high-impact economic events for the next 7 days from ForexFactory.
-    Fetches both this week and next week feeds to ensure full 7-day coverage.
+    Results are cached for 30 minutes to avoid rate-limiting.
     """
+    global _cache, _cache_expires
     now = datetime.now(timezone.utc)
+
+    if _cache_expires and now < _cache_expires:
+        return _cache
+
     cutoff = now + timedelta(days=7)
     timeout = aiohttp.ClientTimeout(total=15)
     events: list[dict] = []
@@ -86,6 +95,10 @@ async def get_week_calendar() -> list[dict]:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, ssl=True) as resp:
+                    if resp.status == 404:
+                        # nextweek endpoint returns 404 when not yet published — expected
+                        logger.debug("Calendar %s not yet published (404)", url)
+                        return []
                     resp.raise_for_status()
                     return await resp.json()
         except Exception as exc:
@@ -116,7 +129,9 @@ async def get_week_calendar() -> list[dict]:
             seen.add(key)
             unique.append(e)
 
-    logger.info("Calendar: %d relevant high-impact USD events in next 7 days", len(unique))
+    _cache = unique
+    _cache_expires = now + _CACHE_TTL
+    logger.info("Calendar: %d relevant high-impact USD events in next 7 days (cached 30m)", len(unique))
     return unique
 
 

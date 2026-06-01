@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 TICKERS = {
     "oil":  "CL=F",   # WTI Crude front-month futures
     "gold": "GC=F",   # Gold front-month futures
-    "dxy":  "DX=F",   # US Dollar Index futures
+    "dxy":  "DX-Y.NYB",   # US Dollar Index (ICE)
 }
 
 # ── Pine Script parameters (exact match) ─────────────────────────────────────
@@ -105,11 +105,25 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     vol_ratio = v / vol_avg
     vol_pct  = _vol_percentile(v, 100)
 
-    # RSI
+    # RSI — Wilder's RMA to match TradingView (seed with SMA, then alpha=1/14)
+    RSI_LEN = 14
     delta = c.diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rs    = gain / loss.replace(0, np.nan)
+    gain  = delta.clip(lower=0)
+    loss  = (-delta.clip(upper=0))
+
+    def _wilder_rma(s: pd.Series, n: int) -> pd.Series:
+        result = np.full(len(s), np.nan)
+        if len(s) < n:
+            return pd.Series(result, index=s.index)
+        result[n - 1] = s.iloc[:n].mean()          # SMA seed (TradingView behaviour)
+        alpha = 1.0 / n
+        for i in range(n, len(s)):
+            result[i] = result[i - 1] * (1 - alpha) + s.iloc[i] * alpha
+        return pd.Series(result, index=s.index)
+
+    avg_gain = _wilder_rma(gain, RSI_LEN)
+    avg_loss = _wilder_rma(loss, RSI_LEN)
+    rs    = avg_gain / avg_loss.replace(0, np.nan)
     rsi   = 100 - 100 / (1 + rs)
 
     # Pull last 4 bars for directional checks (Pine uses [3] lookback)
@@ -254,30 +268,40 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
 
 def finalize_with_htf(ctx: dict, htf_k: float) -> dict:
-    """Add HTF stoch and compute grade + SL/TP."""
+    """Add HTF stoch and compute grade + SL/TP. Downgrades grade when signal opposes weekly trend."""
     ctx = {**ctx, "htf_k": round(htf_k, 1)}
 
-    grade_fn  = ctx.pop("_grade_fn")
+    grade_fn   = ctx.pop("_grade_fn")
     sl_mult_fn = ctx.pop("_sl_mult_fn")
     ctx.pop("_vol_strong", None)
     ctx.pop("_vol_moderate", None)
 
+    wt = ctx.get("weekly_trend", "")  # "bullish" | "bearish" | ""
+
+    def _apply_weekly_downgrade(quality: str, is_long: bool) -> tuple[str, str]:
+        against = (is_long and wt == "bearish") or (not is_long and wt == "bullish")
+        if against and quality != "WEAK":
+            new_quality = "MODERATE" if quality == "STRONG" else "WEAK"
+            return new_quality, "↓WEEKLY"
+        return quality, ""
+
     if ctx["long_signal"]:
         quality = grade_fn(True)
+        quality, wk_note = _apply_weekly_downgrade(quality, True)
         mult    = sl_mult_fn(quality)
-        ctx["signal"]       = "LONG"
-        ctx["signal_grade"] = quality
-        ctx["suggested_sl"] = round(ctx["price"] - ctx["atr"] * mult, 3)
-        ctx["suggested_tp"] = round(ctx["price"] + ctx["atr"] * mult * 2, 3)
+        ctx["signal"]          = "LONG"
+        ctx["signal_grade"]    = f"{quality}{wk_note}" if wk_note else quality
+        ctx["suggested_sl"]    = round(ctx["price"] - ctx["atr"] * mult, 3)
+        ctx["suggested_tp"]    = round(ctx["price"] + ctx["atr"] * mult * 2, 3)
     elif ctx["short_signal"]:
         quality = grade_fn(False)
+        quality, wk_note = _apply_weekly_downgrade(quality, False)
         mult    = sl_mult_fn(quality)
-        ctx["signal"]       = "SHORT"
-        ctx["signal_grade"] = quality
-        ctx["suggested_sl"] = round(ctx["price"] + ctx["atr"] * mult, 3)
-        ctx["suggested_tp"] = round(ctx["price"] - ctx["atr"] * mult * 2, 3)
+        ctx["signal"]          = "SHORT"
+        ctx["signal_grade"]    = f"{quality}{wk_note}" if wk_note else quality
+        ctx["suggested_sl"]    = round(ctx["price"] + ctx["atr"] * mult, 3)
+        ctx["suggested_tp"]    = round(ctx["price"] - ctx["atr"] * mult * 2, 3)
     else:
-        # Suggested levels from bias
         mult = 1.5
         ctx["signal"]       = "NONE"
         ctx["signal_grade"] = "—"
@@ -327,21 +351,30 @@ async def get_market_context(instrument: str) -> Optional[dict]:
 
     loop = asyncio.get_event_loop()
 
-    # Fetch 1H data (60 bars = ~3 trading days, enough for all indicators)
-    df_1h = await loop.run_in_executor(
-        None, _fetch_ohlcv, ticker, "1h", "10d"
+    # Fetch all timeframes concurrently
+    df_1h, df_4h, df_wk = await asyncio.gather(
+        loop.run_in_executor(None, _fetch_ohlcv, ticker, "1h",  "10d"),
+        loop.run_in_executor(None, _fetch_ohlcv, ticker, "4h",  "30d"),
+        loop.run_in_executor(None, _fetch_ohlcv, ticker, "1wk", "2y"),
     )
     if df_1h is None or len(df_1h) < BB_LENGTH + 5:
         logger.warning("Insufficient 1H data for %s", ticker)
         return None
 
-    # Fetch 4H for HTF stoch
-    df_4h = await loop.run_in_executor(
-        None, _fetch_ohlcv, ticker, "4h", "30d"
-    )
-
     # Compute 1H indicators
     ctx = compute_indicators(df_1h)
+
+    # Weekly trend vs 20-week SMA — used to downgrade grades on counter-trend signals
+    if df_wk is not None and len(df_wk) >= 20:
+        wk_c = df_wk["Close"]
+        if isinstance(wk_c, pd.DataFrame):
+            wk_c = wk_c.iloc[:, 0]
+        wk_sma20 = float(wk_c.rolling(20).mean().iloc[-1])
+        wk_price = float(wk_c.iloc[-1])
+        if not (np.isnan(wk_sma20) or np.isnan(wk_price)):
+            ctx["weekly_trend"]        = "bullish" if wk_price > wk_sma20 else "bearish"
+            ctx["weekly_sma20"]        = round(wk_sma20, 2)
+            ctx["weekly_pct_from_sma"] = round((wk_price - wk_sma20) / wk_sma20 * 100, 1)
 
     # Compute HTF K
     htf_k = 50.0  # default neutral if unavailable
@@ -354,6 +387,18 @@ async def get_market_context(instrument: str) -> Optional[dict]:
     ctx["instrument"] = instrument
     ctx["ticker"]     = ticker
     ctx["fetched_at"] = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    # Override price with real-time tick so /advice and /brief show current price
+    def _live_price(t: str) -> Optional[float]:
+        try:
+            p = yf.Ticker(t).fast_info.last_price
+            return float(p) if p else None
+        except Exception:
+            return None
+
+    live = await loop.run_in_executor(None, _live_price, ticker)
+    if live:
+        ctx["price"] = round(live, 3)
 
     logger.info(
         "[%s] price=%.3f regime=%s bias=%s K=%.1f signal=%s",
@@ -401,16 +446,215 @@ async def get_current_prices() -> dict:
     return {"oil": oil, "gold": gold}
 
 
+_WTI_MONTH_CODES = {
+    1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
+    7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z",
+}
+
+
+def _wti_forward_ticker(months_ahead: int) -> str:
+    now   = datetime.now(timezone.utc)
+    m     = now.month + months_ahead
+    year  = now.year + (m - 1) // 12
+    month = ((m - 1) % 12) + 1
+    return f"CL{_WTI_MONTH_CODES[month]}{year % 100:02d}.NYM"
+
+
+async def get_oil_curve() -> dict:
+    """
+    Fetch WTI front, 3-month, and 6-month futures prices.
+    Classifies curve structure: backwardation (tight physical = bullish)
+    vs contango (oversupply = bearish).
+    """
+    loop  = asyncio.get_event_loop()
+    t3m   = _wti_forward_ticker(3)
+    t6m   = _wti_forward_ticker(6)
+
+    def _px(ticker: str) -> Optional[float]:
+        try:
+            p = yf.Ticker(ticker).fast_info.last_price
+            return float(p) if p else None
+        except Exception:
+            return None
+
+    front, p3m, p6m = await asyncio.gather(
+        loop.run_in_executor(None, _px, "CL=F"),
+        loop.run_in_executor(None, _px, t3m),
+        loop.run_in_executor(None, _px, t6m),
+    )
+
+    if front is None:
+        return {}
+
+    out: dict = {"front": round(front, 2), "ticker_3m": t3m, "ticker_6m": t6m}
+
+    if p3m:
+        out["p3m"] = round(p3m, 2)
+    if p6m:
+        out["p6m"] = round(p6m, 2)
+        spread = round(front - p6m, 2)
+        out["spread_6m"] = spread
+        if spread > 1.0:
+            out["structure"] = "backwardation"
+            out["signal"]    = "bullish — physical market tight"
+        elif spread > 0.25:
+            out["structure"] = "mild backwardation"
+            out["signal"]    = "slightly bullish"
+        elif spread < -1.0:
+            out["structure"] = "contango"
+            out["signal"]    = "bearish — oversupply"
+        elif spread < -0.25:
+            out["structure"] = "mild contango"
+            out["signal"]    = "slightly bearish"
+        else:
+            out["structure"] = "flat"
+            out["signal"]    = "neutral"
+
+    logger.info("Oil curve: front=%.2f 6m=%.2f spread=%s structure=%s",
+                front, p6m or 0, out.get("spread_6m", "n/a"), out.get("structure", "n/a"))
+    return out
+
+
+async def get_gld_flow() -> dict:
+    """
+    Estimate GLD ETF holdings in tonnes from yfinance market cap + gold price.
+    Stores daily snapshots; computes day-over-day and 5-day flow deltas.
+    ETF outflows during geopolitical events = institutions selling, not buying.
+    """
+    from database import store_etf_snapshot, get_etf_snapshots
+    loop = asyncio.get_event_loop()
+
+    def _get_gld_info() -> tuple[Optional[float], Optional[float]]:
+        import logging as _logging
+        # Suppress yfinance's own error logger — 401 crumb errors are transient
+        # and handled gracefully; no need to pollute the terminal with them.
+        _yf_log = _logging.getLogger("yfinance")
+        _prev   = _yf_log.level
+        _yf_log.setLevel(_logging.CRITICAL)
+        try:
+            fi = yf.Ticker("GLD").fast_info
+            mc = getattr(fi, "market_cap", None) or getattr(fi, "marketCap", None)
+            return float(mc) if mc else None, None
+        except Exception:
+            return None, None
+        finally:
+            _yf_log.setLevel(_prev)
+
+    market_cap, _ = await loop.run_in_executor(None, _get_gld_info)
+    if not market_cap:
+        return {}
+
+    gold_price = await loop.run_in_executor(None, lambda: (
+        float(yf.Ticker("GC=F").fast_info.last_price or 0)
+    ))
+    if not gold_price:
+        return {}
+
+    TROY_OZ_PER_TONNE = 32_150.7
+    tonnes = market_cap / gold_price / TROY_OZ_PER_TONNE
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    await store_etf_snapshot("GLD", today, market_cap, round(tonnes, 1))
+    snapshots = await get_etf_snapshots("GLD", days=6)
+
+    out: dict = {
+        "tonnes":          round(tonnes, 1),
+        "aum_bn":          round(market_cap / 1e9, 1),
+    }
+
+    if len(snapshots) >= 2:
+        prev_tonnes        = snapshots[-2]["tonnes"]
+        delta_1d           = round(tonnes - prev_tonnes, 1)
+        out["delta_1d"]    = delta_1d
+        if delta_1d < -5:
+            out["signal"]  = "bearish — large institutional outflow"
+        elif delta_1d < -1:
+            out["signal"]  = "mildly bearish — small outflow"
+        elif delta_1d > 5:
+            out["signal"]  = "bullish — large institutional inflow"
+        elif delta_1d > 1:
+            out["signal"]  = "mildly bullish — small inflow"
+        else:
+            out["signal"]  = "neutral — flat holdings"
+
+    if len(snapshots) >= 5:
+        out["delta_5d"] = round(tonnes - snapshots[0]["tonnes"], 1)
+
+    logger.info("GLD ETF: %.1ft (Δ1d=%+.1ft) — %s",
+                tonnes, out.get("delta_1d", 0), out.get("signal", "n/a"))
+    return out
+
+
+async def get_correlated_context(instrument: str) -> dict:
+    """
+    Fetch short-timeframe correlated data for /drill:
+      - 15-min bars for the instrument and DXY (last 2 hours of micro-movement)
+      - US 10-year yield (^TNX)  — primary gold driver, not otherwise in system
+      - Silver (SI=F)            — gold confirmation signal
+      - Natural gas (NG=F)       — oil/energy correlation
+    """
+    loop = asyncio.get_event_loop()
+
+    CORR_TICKERS: dict[str, str] = {
+        "instrument_15m": TICKERS.get(instrument, ""),
+        "dxy_15m":        TICKERS["dxy"],
+        "10yr_yield":     "^TNX",
+    }
+    if instrument == "gold":
+        CORR_TICKERS["silver"] = "SI=F"
+    elif instrument == "oil":
+        CORR_TICKERS["nat_gas"] = "NG=F"
+
+    def _summarise_15m(ticker: str) -> Optional[dict]:
+        try:
+            df = yf.download(ticker, period="2d", interval="15m",
+                             progress=False, auto_adjust=True)
+            if df.empty or len(df) < 4:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            c = df["Close"]
+            recent = c.iloc[-8:] if len(c) >= 8 else c
+            bars   = [round(float(x), 3) for x in recent.tolist()]
+            last   = bars[-1]
+            chg_1h = round((last - bars[-4]) / bars[-4] * 100, 2) if len(bars) >= 4 else 0.0
+            # simple linear direction over last 8 bars
+            if len(bars) >= 4:
+                first_half = sum(bars[:len(bars)//2]) / (len(bars)//2)
+                second_half = sum(bars[len(bars)//2:]) / (len(bars) - len(bars)//2)
+                direction = "rising" if second_half > first_half * 1.0005 else \
+                            "falling" if second_half < first_half * 0.9995 else "flat"
+            else:
+                direction = "flat"
+            return {"price": last, "change_1h_pct": chg_1h,
+                    "direction": direction, "bars": bars}
+        except Exception:
+            return None
+
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, _summarise_15m, t) for t in CORR_TICKERS.values()],
+        return_exceptions=True,
+    )
+    out = {}
+    for key, res in zip(CORR_TICKERS.keys(), results):
+        out[key] = None if isinstance(res, Exception) else res
+    return out
+
+
 async def get_both_contexts() -> dict:
-    """Fetch oil, gold, and DXY contexts concurrently."""
-    oil_ctx, gold_ctx, dxy_ctx = await asyncio.gather(
+    """Fetch oil, gold, DXY, oil futures curve, and GLD ETF flow concurrently."""
+    oil_ctx, gold_ctx, dxy_ctx, oil_curve, gld_flow = await asyncio.gather(
         get_market_context("oil"),
         get_market_context("gold"),
         get_dxy_context(),
+        get_oil_curve(),
+        get_gld_flow(),
         return_exceptions=True,
     )
     return {
-        "oil":  oil_ctx  if not isinstance(oil_ctx,  Exception) else None,
-        "gold": gold_ctx if not isinstance(gold_ctx, Exception) else None,
-        "dxy":  dxy_ctx  if not isinstance(dxy_ctx,  Exception) else {},
+        "oil":       oil_ctx   if not isinstance(oil_ctx,   Exception) else None,
+        "gold":      gold_ctx  if not isinstance(gold_ctx,  Exception) else None,
+        "dxy":       dxy_ctx   if not isinstance(dxy_ctx,   Exception) else {},
+        "oil_curve": oil_curve if not isinstance(oil_curve, Exception) else {},
+        "gld_flow":  gld_flow  if not isinstance(gld_flow,  Exception) else {},
     }

@@ -1,14 +1,22 @@
 """
 sources.py — one async function per data source.
 
-Feed status as of 2026-05-31 (verified from Mac):
-  EIA              — RSS times out; scrape HTML weekly report page
-  OPEC             — HTML scrape (no RSS)
-  State Dept       — state.gov/feed/ RSS ✅
-  IAEA             — HTML scrape (feed URLs unstable)
-  FT               — ft.com/rss/home RSS ✅  (replaces dead Reuters)
-  AP               — hub/business?format=rss loads HTML; scrape it
-  Baker Hughes     — rigcount.bakerhughes.com times out; scrape bakerhughes.com/rig-count
+Feed status as of 2026-06-01 (verified):
+  EIA              — HTML scrape weekly report page ✅
+  OilPrice.com     — RSS ✅
+  State Dept       — HTML scrape press-releases ✅
+  Mining.com       — mining.com/feed/ RSS ✅  (gold price drivers, safe-haven analysis)
+  FT               — ft.com/rss/home RSS ✅
+  AP               — hub/energy HTML scrape ✅
+  World Oil        — worldoil.com RSS ✅
+  CNBC Energy      — cnbc.com RSS ✅
+  Federal Reserve  — federalreserve.gov RSS ✅
+  US Treasury      — HTML scrape ✅
+  MarketWatch      — feeds.marketwatch.com RSS ✅  (macro/rates/dollar commentary)
+  Arab News        — arabnews.com RSS ✅
+  TASS English     — tass.com RSS ✅
+  BBC World        — feeds.bbci.co.uk RSS ✅  (replaces CFR — no working RSS)
+  Reuters          — feeds.reuters.com (DEAD — commented out)
 """
 
 import logging
@@ -320,62 +328,22 @@ async def fetch_state_dept(session: aiohttp.ClientSession) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Source 4 — IAEA Press Releases (HTML scrape)
+# Source 4 — Mining.com (gold/metals news, WordPress RSS)
 # ---------------------------------------------------------------------------
 
 async def fetch_iaea(session: aiohttp.ClientSession) -> list[dict]:
-    source_name = "IAEA"
-    page_url = "https://www.iaea.org/newscenter/pressreleases"
-
-    text = await _fetch_text(session, page_url)
-    if not text:
-        return []
-
-    soup = BeautifulSoup(text, "html.parser")
-    new_items: list[dict] = []
-    base = "https://www.iaea.org"
-
-    for a in soup.find_all("a", href=True):
-        href: str = a["href"]
-        if "/newscenter/pressreleases/" not in href:
-            continue
-        if href.rstrip("/") == "/newscenter/pressreleases":
-            continue
-        if href.startswith("/"):
-            href = base + href
-        if not href.startswith("http"):
-            continue
-
-        title = a.get_text(strip=True)
-        if len(title) < 10:
-            continue
-
-        if await is_seen(href):
-            continue
-
-        ts = _now_utc()
-        item = {
-            "source_name": source_name,
-            "title": title,
-            "url": href,
-            "timestamp": ts,
-            "summary": None,
-        }
-        await mark_seen(href, source_name, title, None, ts)
-        new_items.append(item)
-        logger.info("[%s] new item: %s", source_name, title[:80])
-
-    IAEA_KEEP = {
-        "iran", "iraq", "ukraine", "russia", "weapons", "enrichment",
-        "nuclear fuel", "nuclear program", "nuclear deal", "nonprolifer",
-        "safeguards", "inspections", "uranium", "plutonium",
-        "venezuela", "north korea", "pakistan", "middle east",
-    }
-    def _iaea_relevant(title: str) -> bool:
-        t = title.lower()
-        return any(kw in t for kw in IAEA_KEEP)
-
-    return [i for i in new_items if _iaea_relevant(i["title"])]
+    """
+    Mining.com — covers gold price drivers, central bank buying, safe-haven
+    flows, Fed/rates impact on gold, and geopolitical premium/discount analysis.
+    WordPress site with reliable /feed/ endpoint.
+    """
+    return await _process_rss_feed(
+        session,
+        "https://www.mining.com/feed/",
+        "Mining.com",
+        max_new=10,
+        filter_fn=_is_relevant,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +454,191 @@ async def fetch_cnbc(session: aiohttp.ClientSession) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Source 9 — Federal Reserve (RSS)
+# ---------------------------------------------------------------------------
+
+async def fetch_fed(session: aiohttp.ClientSession) -> list[dict]:
+    """Federal Reserve press releases — FOMC statements, minutes, rate decisions."""
+    FED_KEEP = {
+        "fomc", "federal open market", "interest rate", "monetary policy",
+        "rate decision", "minutes of", "powell", "inflation",
+        "employment", "economic outlook", "balance sheet", "basis point",
+    }
+    def _fed_relevant(title: str) -> bool:
+        t = title.lower()
+        return any(kw in t for kw in FED_KEEP)
+
+    return await _process_rss_feed(
+        session,
+        "https://www.federalreserve.gov/feeds/press_all.xml",
+        "Federal Reserve",
+        max_new=5,
+        filter_fn=_fed_relevant,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source 10 — US Treasury (HTML scrape)
+# ---------------------------------------------------------------------------
+
+async def fetch_treasury(session: aiohttp.ClientSession) -> list[dict]:
+    """US Treasury press releases — sanctions, Iran financial measures, dollar policy."""
+    source_name = "US Treasury"
+    page_url = "https://home.treasury.gov/news/press-releases"
+
+    TREASURY_KEEP = {
+        "sanction", "iran", "russia", "venezuela", "north korea",
+        "oil", "energy", "petroleum", "opec", "dollar",
+        "gold", "commodity", "ofac", "designation", "nuclear",
+    }
+
+    text = await _fetch_text(session, page_url)
+    if not text:
+        return []
+
+    soup = BeautifulSoup(text, "html.parser")
+    new_items: list[dict] = []
+    base = "https://home.treasury.gov"
+    seen_hrefs: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        href: str = a["href"]
+        if "/news/press-releases/" not in href:
+            continue
+        if href.rstrip("/") in ("/news/press-releases", ""):
+            continue
+        if href.startswith("/"):
+            href = base + href
+        if href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
+
+        title = a.get_text(strip=True)
+        if len(title) < 10:
+            continue
+
+        t = title.lower()
+        if not any(kw in t for kw in TREASURY_KEEP):
+            continue
+
+        if await is_seen(href):
+            continue
+
+        ts = _now_utc()
+        item = {
+            "source_name": source_name,
+            "title": title,
+            "url": href,
+            "timestamp": ts,
+            "summary": None,
+        }
+        await mark_seen(href, source_name, title, None, ts)
+        new_items.append(item)
+        logger.info("[%s] new item: %s", source_name, title[:80])
+
+        if len(new_items) >= 5:
+            break
+
+    return new_items
+
+
+# ---------------------------------------------------------------------------
+# Source 11 — MarketWatch (macro/rates/dollar commentary)
+# ---------------------------------------------------------------------------
+
+async def fetch_iea(session: aiohttp.ClientSession) -> list[dict]:
+    """
+    MarketWatch top stories — covers Fed/rates reactions, economic data,
+    dollar moves, and commodity market context. Fills the gap that explains
+    WHY gold drops despite geopolitics (e.g. strong PMI → DXY surge).
+    """
+    return await _process_rss_feed(
+        session,
+        "https://feeds.marketwatch.com/marketwatch/topstories/",
+        "MarketWatch",
+        max_new=8,
+        filter_fn=_is_relevant,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source 12 — Arab News (RSS)
+# ---------------------------------------------------------------------------
+
+async def fetch_arabnews(session: aiohttp.ClientSession) -> list[dict]:
+    """Arab News — Saudi and Gulf energy news direct from primary regional source."""
+    return await _process_rss_feed(
+        session,
+        "https://www.arabnews.com/rss.xml",
+        "Arab News",
+        max_new=8,
+        filter_fn=_is_relevant,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source 13 — TASS English (RSS)
+# ---------------------------------------------------------------------------
+
+async def fetch_tass(session: aiohttp.ClientSession) -> list[dict]:
+    """TASS English — Russian energy exports, OPEC+ Russia position, pipeline news."""
+    TASS_KEEP = {
+        "oil", "gas", "opec", "energy", "barrel", "crude",
+        "lng", "pipeline", "export", "sanction", "petroleum",
+        "gold", "commodity", "price", "supply", "gazprom",
+        "rosneft", "novatek", "lukoil", "russia energy",
+    }
+    def _tass_relevant(title: str) -> bool:
+        t = title.lower()
+        return any(kw in t for kw in TASS_KEEP)
+
+    return await _process_rss_feed(
+        session,
+        "https://tass.com/rss/v2.xml",
+        "TASS",
+        max_new=8,
+        filter_fn=_tass_relevant,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source 14 — BBC World News RSS (replaces CFR — cfr.org has no working RSS)
+# ---------------------------------------------------------------------------
+
+async def fetch_cfr(session: aiohttp.ClientSession) -> list[dict]:
+    """
+    BBC World News RSS — geopolitical coverage including Middle East, Russia, and
+    energy-relevant conflicts. Reliable public feed. Replaces CFR which has no
+    working public RSS endpoint.
+    """
+    return await _process_rss_feed(
+        session,
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "BBC World",
+        max_new=8,
+        filter_fn=_is_relevant,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source 15 — Reuters Business RSS (fallback — fails gracefully if feed is dead)
+# ---------------------------------------------------------------------------
+
+async def fetch_reuters(session: aiohttp.ClientSession) -> list[dict]:
+    """Reuters commodities/business feed — falls back gracefully if domain is down."""
+    for url in (
+        "https://feeds.reuters.com/reuters/commoditiesNews",
+        "https://feeds.reuters.com/reuters/businessNews",
+    ):
+        items = await _process_rss_feed(
+            session, url, "Reuters", max_new=8, filter_fn=_is_relevant
+        )
+        if items:
+            return items
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -498,4 +651,11 @@ ALL_SOURCES = [
     fetch_ap,
     fetch_worldoil,
     fetch_cnbc,
+    fetch_fed,
+    fetch_treasury,
+    fetch_iea,
+    fetch_arabnews,
+    fetch_tass,
+    fetch_cfr,
+    # fetch_reuters — feeds.reuters.com domain dead as of 2026-06
 ]

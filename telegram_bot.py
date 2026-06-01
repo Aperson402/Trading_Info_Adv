@@ -287,6 +287,59 @@ async def send_advice(advice_text: str) -> None:
     await _send(bot, message)
 
 
+async def send_log(log_path: str, lines: int = 50) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            tail = f.readlines()[-lines:]
+        text = "".join(tail).strip() or "(log is empty)"
+    except Exception as exc:
+        text = f"Could not read log: {exc}"
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    header = f"📄 <b>LOG — last {lines} lines — {_h(now_str)}</b>\n\n"
+    # Truncate so header + <pre> tags fit in one message (no mid-tag splits)
+    max_text = 3800 - len(header) - len("<pre></pre>")
+    escaped = _h(text)
+    if len(escaped) > max_text:
+        escaped = "…" + escaped[-max_text + 1:]
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=header + f"<pre>{escaped}</pre>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        logger.error("Telegram send failed: %s", exc)
+
+
+async def send_event_reaction(event: dict, oil_pre: float, gold_pre: float,
+                              oil_post: float, gold_post: float, analysis: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+
+    def _move(pre, post):
+        if not pre:
+            return "—"
+        pct = (post - pre) / pre * 100
+        arrow = "↑" if pct > 0 else "↓"
+        return f"{arrow} {abs(pct):.2f}%"
+
+    oil_str  = f"${oil_post:,.2f} ({_move(oil_pre, oil_post)})"  if oil_post  else "—"
+    gold_str = f"${gold_post:,.2f} ({_move(gold_pre, gold_post)})" if gold_post else "—"
+
+    message = (
+        f"⚡ <b>REACTION — {_h(event.get('title', ''))}</b>\n"
+        f"Actual: <b>{_h(event.get('actual', '—'))}</b>  Forecast: {_h(event.get('forecast', '—'))}\n"
+        f"🛢 Oil: {_h(oil_str)}  🥇 Gold: {_h(gold_str)}\n\n"
+        f"{_h(analysis)}"
+    )
+    await _send(bot, message)
+
+
 async def send_event_alert(event: dict, kind: str = "upcoming") -> None:
     """Send a pre-event warning or post-event result alert."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -341,6 +394,81 @@ async def send_calendar(events: list[dict]) -> None:
 
     message = f"{header}\n\n" + "\n".join(lines)
     await _send(bot, message)
+
+
+async def send_drill(instrument: str, drill_text: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    header = f"🔬 <b>DRILL — {instrument.upper()} — {_h(now_str)}</b>"
+    message = f"{header}\n\n{_h(drill_text)}"
+    await _send(bot, message)
+
+
+async def send_batch_digest(items: list[dict]) -> None:
+    """Send a compact digest of medium-confidence (6-7) items as a single message."""
+    if not items or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [f"📋 <b>DIGEST — {len(items)} item(s) — {_h(now_str)}</b>\n"]
+    for item in items:
+        inst  = item.get("instrument", "")
+        dirn  = item.get("direction",  "")
+        conf  = item.get("confidence", "?")
+        src   = item.get("source_name", "?")
+        title = item.get("title", "")
+        url   = item.get("url",   "")
+        dir_emoji = _DIRECTION_EMOJI.get(dirn, "⚪")
+        tag = f"{dir_emoji} {inst.upper()} " if inst and inst != "neither" else ""
+        lines.append(
+            f"• {tag}<b>{conf}/10</b>  {_h(src)}\n"
+            f"  {_h(title)}\n"
+            f"  {url}"
+        )
+    await _send(bot, "\n".join(lines))
+
+
+async def send_signal_stats(stats: dict) -> None:
+    """Send /signals accuracy report."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [f"📈 <b>SIGNAL ACCURACY — last 30 days — {_h(now_str)}</b>\n"]
+
+    agg = stats.get("stats", [])
+    if not agg:
+        lines.append("<i>No resolved signals yet. Run /advice or wait for a morning brief.</i>")
+    else:
+        for row in agg:
+            inst    = row["instrument"].upper()
+            dirn    = row["direction"].upper()
+            emoji   = "🥇" if row["instrument"] == "gold" else "🛢"
+            dir_em  = "🟢" if row["direction"] == "long" else "🔴"
+            r2, h2  = row["resolved_2h"] or 0, row["hit_2h"] or 0
+            r4, h4  = row["resolved_4h"] or 0, row["hit_4h"] or 0
+            acc_2h  = f"{h2}/{r2} ({h2*100//r2}%)" if r2 else "—"
+            acc_4h  = f"{h4}/{r4} ({h4*100//r4}%)" if r4 else "—"
+            lines.append(f"{emoji}{dir_em} <b>{inst} {dirn}</b>  2h: {acc_2h}  4h: {acc_4h}")
+
+    recent = stats.get("recent", [])
+    if recent:
+        lines.append("\n<b>Recent:</b>")
+        for sig in recent[:8]:
+            inst  = sig["instrument"]
+            dirn  = sig["direction"]
+            emoji = "🥇" if inst == "gold" else "🛢"
+            dem   = "🟢" if dirn == "long" else "🔴"
+            c2    = "✅" if sig["correct_2h"] == 1 else "❌" if sig["correct_2h"] == 0 else "⏳"
+            c4    = "✅" if sig["correct_4h"] == 1 else "❌" if sig["correct_4h"] == 0 else "⏳"
+            entry = sig["entry_price"]
+            src   = sig.get("source", "")
+            ts    = (sig.get("recorded_at") or "")[:16].replace("T", " ")
+            lines.append(f"{emoji}{dem} <b>{dirn.upper()}</b> @ ${entry:,.2f}  {c2}{c4}  <i>{_h(src)} {_h(ts)}</i>")
+
+    await _send(bot, "\n".join(lines))
 
 
 async def send_cot_update(cot_data: dict) -> None:

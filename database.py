@@ -63,7 +63,54 @@ async def init_db() -> None:
             )
         """)
         await db.commit()
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS etf_snapshots (
+                symbol      TEXT NOT NULL,
+                date        TEXT NOT NULL,
+                market_cap  REAL,
+                tonnes      REAL,
+                PRIMARY KEY (symbol, date)
+            )
+        """)
+        await db.commit()
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS signal_outcomes (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                instrument      TEXT NOT NULL,
+                direction       TEXT NOT NULL,
+                source          TEXT NOT NULL,
+                entry_price     REAL NOT NULL,
+                recorded_at     TEXT NOT NULL,
+                resolve_at_2h   TEXT NOT NULL,
+                resolve_at_4h   TEXT NOT NULL,
+                price_2h        REAL,
+                price_4h        REAL,
+                correct_2h      INTEGER,
+                correct_4h      INTEGER
+            )
+        """)
+        await db.commit()
     logger.info("Database initialised at %s", DATABASE_PATH)
+
+
+async def store_etf_snapshot(symbol: str, date: str, market_cap: float, tonnes: float) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO etf_snapshots (symbol, date, market_cap, tonnes) VALUES (?,?,?,?)",
+            (symbol, date, market_cap, tonnes),
+        )
+        await db.commit()
+
+
+async def get_etf_snapshots(symbol: str, days: int = 5) -> list[dict]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT date, market_cap, tonnes FROM etf_snapshots WHERE symbol=? ORDER BY date DESC LIMIT ?",
+            (symbol, days),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in reversed(rows)]
 
 
 async def is_seen(url: str) -> bool:
@@ -262,6 +309,98 @@ async def close_trade(trade_id: int, close_price: float, outcome: str) -> dict:
 
     return {**trade, "closed_at": closed_at, "close_price": close_price,
             "outcome": outcome, "pnl_pct": round(pnl_pct, 3)}
+
+
+async def record_signal(
+    instrument: str,
+    direction: str,
+    source: str,
+    entry_price: float,
+) -> Optional[int]:
+    """
+    Record a LONG/SHORT signal for outcome tracking.
+    Skips duplicates — same instrument+direction recorded within the last 2 hours.
+    Returns new signal ID, or None if skipped.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff     = (now - timedelta(hours=2)).isoformat()
+    resolve_2h = (now + timedelta(hours=2)).isoformat()
+    resolve_4h = (now + timedelta(hours=4)).isoformat()
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        dup = await db.execute(
+            "SELECT id FROM signal_outcomes WHERE instrument=? AND direction=? AND recorded_at >= ?",
+            (instrument, direction, cutoff),
+        )
+        if await dup.fetchone():
+            return None  # duplicate within 2h window — skip
+        cursor = await db.execute(
+            """INSERT INTO signal_outcomes
+               (instrument, direction, source, entry_price, recorded_at, resolve_at_2h, resolve_at_4h)
+               VALUES (?,?,?,?,?,?,?)""",
+            (instrument, direction, source, entry_price,
+             now.isoformat(), resolve_2h, resolve_4h),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_pending_signals() -> list[dict]:
+    """Return signals that have reached their resolution window but aren't fully resolved."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM signal_outcomes
+               WHERE (correct_2h IS NULL AND resolve_at_2h <= ?)
+                  OR (correct_4h IS NULL AND resolve_at_4h <= ?)""",
+            (now, now),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def resolve_signal(signal_id: int, **kwargs) -> None:
+    """Update price/correct fields on a signal outcome record."""
+    if not kwargs:
+        return
+    sets = ", ".join(f"{k}=?" for k in kwargs)
+    vals = list(kwargs.values()) + [signal_id]
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(f"UPDATE signal_outcomes SET {sets} WHERE id=?", vals)
+        await db.commit()
+
+
+async def get_signal_stats(days: int = 30) -> dict:
+    """Accuracy stats grouped by instrument+direction plus 10 most recent signals."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT instrument, direction,
+                      COUNT(*) AS total,
+                      SUM(CASE WHEN correct_2h IS NOT NULL THEN 1 ELSE 0 END) AS resolved_2h,
+                      SUM(CASE WHEN correct_2h = 1        THEN 1 ELSE 0 END) AS hit_2h,
+                      SUM(CASE WHEN correct_4h IS NOT NULL THEN 1 ELSE 0 END) AS resolved_4h,
+                      SUM(CASE WHEN correct_4h = 1        THEN 1 ELSE 0 END) AS hit_4h
+               FROM signal_outcomes
+               WHERE recorded_at >= ?
+               GROUP BY instrument, direction
+               ORDER BY instrument, direction""",
+            (since,),
+        )
+        stats_rows = await cursor.fetchall()
+        cursor2 = await db.execute(
+            """SELECT * FROM signal_outcomes
+               WHERE recorded_at >= ?
+               ORDER BY recorded_at DESC LIMIT 10""",
+            (since,),
+        )
+        recent_rows = await cursor2.fetchall()
+    return {
+        "stats":  [dict(r) for r in stats_rows],
+        "recent": [dict(r) for r in recent_rows],
+    }
 
 
 async def get_recent_trades(limit: int = 5) -> list[dict]:
