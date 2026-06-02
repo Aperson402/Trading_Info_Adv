@@ -90,6 +90,21 @@ async def init_db() -> None:
             )
         """)
         await db.commit()
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS watches (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                instrument      TEXT NOT NULL,
+                condition       TEXT NOT NULL,
+                check_interval  INTEGER NOT NULL DEFAULT 15,
+                created_at      TEXT NOT NULL,
+                expires_at      TEXT NOT NULL,
+                last_checked_at TEXT,
+                next_check_at   TEXT NOT NULL,
+                fired           INTEGER NOT NULL DEFAULT 0,  -- 0=active, 1=triggered, 2=cancelled
+                fired_at        TEXT
+            )
+        """)
+        await db.commit()
     logger.info("Database initialised at %s", DATABASE_PATH)
 
 
@@ -401,6 +416,88 @@ async def get_signal_stats(days: int = 30) -> dict:
         "stats":  [dict(r) for r in stats_rows],
         "recent": [dict(r) for r in recent_rows],
     }
+
+
+async def create_watch(
+    instrument: str,
+    condition: str,
+    check_interval: int,
+    expires_minutes: int,
+) -> int:
+    now        = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(minutes=expires_minutes)).isoformat()
+    next_check = (now + timedelta(minutes=check_interval)).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO watches
+               (instrument, condition, check_interval, created_at, expires_at, next_check_at)
+               VALUES (?,?,?,?,?,?)""",
+            (instrument, condition, check_interval, now.isoformat(), expires_at, next_check),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_due_watches() -> list[dict]:
+    """Watches that are active and whose next_check_at has arrived."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM watches
+               WHERE fired = 0 AND next_check_at <= ? AND expires_at > ?
+               ORDER BY next_check_at ASC""",
+            (now, now),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_active_watches() -> list[dict]:
+    """All watches that haven't fired or expired yet."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM watches
+               WHERE fired = 0 AND expires_at > ?
+               ORDER BY created_at DESC""",
+            (now,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def advance_watch(watch_id: int, check_interval: int) -> None:
+    """Push next_check_at forward by check_interval minutes."""
+    now        = datetime.now(timezone.utc)
+    next_check = (now + timedelta(minutes=check_interval)).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE watches SET last_checked_at=?, next_check_at=? WHERE id=?",
+            (now.isoformat(), next_check, watch_id),
+        )
+        await db.commit()
+
+
+async def fire_watch(watch_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE watches SET fired=1, fired_at=?, last_checked_at=? WHERE id=?",
+            (now, now, watch_id),
+        )
+        await db.commit()
+
+
+async def cancel_watch(watch_id: int) -> bool:
+    """Cancel a watch by ID. Returns False if not found or already fired."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE watches SET fired=2 WHERE id=? AND fired=0", (watch_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def get_recent_trades(limit: int = 5) -> list[dict]:

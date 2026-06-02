@@ -19,10 +19,14 @@ async def run_all_sources() -> list[dict]:
     Returns a flat list of new items across all sources.
     Individual source failures are caught and logged; others continue.
     """
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    # aiohttp.ClientTimeout uses asyncio.timeout() internally, which requires
+    # asyncio.current_task() to be non-None (strict in Python 3.12+). Apply
+    # the per-source timeout at the task level with asyncio.wait_for() instead.
+    async with aiohttp.ClientSession() as session:
+        async def _run(source):
+            return await asyncio.wait_for(source(session), timeout=REQUEST_TIMEOUT_SECONDS)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = [source(session) for source in ALL_SOURCES]
+        tasks   = [asyncio.create_task(_run(source)) for source in ALL_SOURCES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_new_items: list[dict] = []

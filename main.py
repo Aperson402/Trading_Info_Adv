@@ -36,9 +36,11 @@ from config import (
     TELEGRAM_TOKEN,
 )
 from database import (
-    close_trade, get_items_since, get_open_trades, get_recent_trades,
-    get_pending_signals, get_sentiment_window, get_signal_stats,
-    init_db, open_trade, record_signal, resolve_signal, update_classification,
+    advance_watch, cancel_watch, close_trade, create_watch,
+    get_active_watches, get_due_watches, get_items_since,
+    get_open_trades, get_pending_signals, get_recent_trades,
+    get_sentiment_window, get_signal_stats,
+    fire_watch, init_db, open_trade, record_signal, resolve_signal, update_classification,
 )
 from monitor import run_all_sources
 from telegram_bot import (
@@ -46,6 +48,7 @@ from telegram_bot import (
     send_event_alert, send_event_reaction, send_log, send_morning_brief,
     send_new_items, send_price_alert, send_signal_stats,
     send_trade_closed, send_trade_opened, send_trades_list,
+    send_watch_triggered, send_watch_update, send_watches_list,
 )
 
 class _ColorFormatter(logging.Formatter):
@@ -84,6 +87,30 @@ logging.root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 logging.root.addHandler(_console)
 logging.root.addHandler(_file)
 logger = logging.getLogger(__name__)
+
+_TF_ALIASES: dict[str, str] = {
+    # 5-minute
+    "5m": "5m", "5min": "5m", "5minute": "5m",
+    # 15-minute
+    "15m": "15m", "15min": "15m", "15minute": "15m",
+    # 30-minute
+    "30m": "30m", "30min": "30m", "30minute": "30m",
+    # 2-hour
+    "2h": "2h", "2hr": "2h", "2hour": "2h",
+    # 4-hour
+    "4h": "4h", "4hr": "4h", "4hour": "4h",
+    # Daily
+    "1d": "1d", "daily": "1d", "day": "1d",
+    # Weekly
+    "1w": "1w", "weekly": "1w", "week": "1w",
+    # Overnight
+    "overnight": "overnight", "on": "overnight", "night": "overnight",
+}
+
+def _normalise_timeframe(raw: str) -> str:
+    """Map user input like '5M', '2H', 'overnight' to a canonical key used by drill.py."""
+    return _TF_ALIASES.get(raw.lower().strip(), "")
+
 
 # Track which events have already been alerted to avoid duplicates
 _alerted_upcoming: set[str] = set()
@@ -185,9 +212,15 @@ async def poll_commands(bot: Bot) -> None:
                     parts = msg.text.split()
                     instrument = parts[1].lower() if len(parts) > 1 else ""
                     if instrument not in ("oil", "gold"):
-                        await msg.reply_text("⚠️ Use: /drill oil  or  /drill gold")
+                        await msg.reply_text(
+                            "⚠️ Use: /drill oil [timeframe]  or  /drill gold [timeframe]\n"
+                            "Timeframes: 5m  15m  30m  2h  4h  1d  1w  overnight"
+                        )
                         continue
-                    await msg.reply_text(f"🔬 Drilling into {instrument.upper()} — fetching correlated data…")
+                    raw_tf   = parts[2].lower() if len(parts) > 2 else ""
+                    timeframe = _normalise_timeframe(raw_tf)
+                    tf_label  = f" [{timeframe}]" if timeframe else ""
+                    await msg.reply_text(f"🔬 Drilling into {instrument.upper()}{tf_label} — fetching data…")
                     since = datetime.now(timezone.utc) - timedelta(hours=4)
                     items, mkt, corr, calendar_events, fred_ctx = await asyncio.gather(
                         get_items_since(since),
@@ -203,11 +236,27 @@ async def poll_commands(bot: Bot) -> None:
                     drill_text = await generate_drill(
                         instrument, ctx, dxy_ctx, corr, items, calendar_events,
                         fred_ctx=fred_ctx, oil_curve=oil_curve, gld_flow=gld_flow,
+                        timeframe=timeframe,
                     )
-                    await send_drill(instrument, drill_text)
+                    await send_drill(instrument, drill_text, timeframe=timeframe)
                 elif msg and msg.text and msg.text.startswith("/signals"):
                     stats = await get_signal_stats(days=30)
                     await send_signal_stats(stats)
+                elif msg and msg.text and msg.text.startswith("/watches"):
+                    watches = await get_active_watches()
+                    await send_watches_list(watches)
+                elif msg and msg.text and msg.text.startswith("/cancelwatch"):
+                    parts = msg.text.split()
+                    try:
+                        watch_id = int(parts[1])
+                    except (IndexError, ValueError):
+                        await msg.reply_text("⚠️ Use: /cancelwatch <id>  (see /watches for IDs)")
+                        continue
+                    ok = await cancel_watch(watch_id)
+                    if ok:
+                        await msg.reply_text(f"✅ Watch #{watch_id} cancelled.")
+                    else:
+                        await msg.reply_text(f"⚠️ Watch #{watch_id} not found or already done.")
                 elif msg and msg.text and msg.text.startswith("/trade "):
                     parts = msg.text.split()
                     try:
@@ -451,6 +500,65 @@ async def job_signal_resolution() -> None:
         logger.error("Signal resolution error: %s", exc)
 
 
+async def job_watch_checker() -> None:
+    """Every 5 min: check due watches, evaluate condition via Claude Haiku, send update or trigger."""
+    due = await get_due_watches()
+    if not due:
+        return
+
+    import anthropic as _anthropic
+
+    async def _evaluate(condition: str, instrument: str, ctx: dict) -> tuple[bool, str]:
+        def g(k):
+            v = (ctx or {}).get(k)
+            return v if v is not None else "n/a"
+        prompt = (
+            f"Market state for {instrument.upper()} right now:\n"
+            f"Price: ${g('price')}  |  Regime: {g('regime')}  |  Bias: {g('bias')}\n"
+            f"RSI: {g('rsi')}  |  Stoch K={g('k')} D={g('d')} ({g('stoch_zone')})\n"
+            f"BB pos: {g('bb_pos')}  |  Signal: {g('signal')}  |  ATR: {g('atr')}\n\n"
+            f"Watch condition: {condition}\n\n"
+            "Is this condition currently met? Reply in exactly this format:\n"
+            "MET: yes|no\n"
+            "STATUS: [one sentence — current values vs what the condition requires]"
+        )
+        try:
+            client = _anthropic.AsyncAnthropic()
+            resp = await client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=120,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = resp.content[0].text.strip()
+            met = "met: yes" in text.lower()
+            status = next(
+                (l.replace("STATUS:", "").strip() for l in text.splitlines() if l.startswith("STATUS:")),
+                text,
+            )
+            return met, status
+        except Exception as exc:
+            logger.error("Watch evaluation error: %s", exc)
+            return False, f"evaluation error: {exc}"
+
+    mkt = await get_both_contexts()
+
+    for watch in due:
+        instrument = watch["instrument"]
+        ctx        = mkt.get(instrument) or {}
+        try:
+            met, status = await _evaluate(watch["condition"], instrument, ctx)
+            if met:
+                await send_watch_triggered(watch, status)
+                await fire_watch(watch["id"])
+                logger.info("Watch #%d triggered [%s]: %s", watch["id"], instrument, status)
+            else:
+                await send_watch_update(watch, status)
+                await advance_watch(watch["id"], watch["check_interval"])
+                logger.info("Watch #%d updated [%s]: %s", watch["id"], instrument, status)
+        except Exception as exc:
+            logger.error("Watch #%d check failed: %s", watch["id"], exc)
+
+
 async def job_morning_brief() -> None:
     logger.info("▶  Morning brief job started")
     try:
@@ -556,6 +664,15 @@ async def main() -> None:
         trigger=IntervalTrigger(minutes=15),
         id="signal_resolution",
         name="Signal Resolution",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    scheduler.add_job(
+        job_watch_checker,
+        trigger=IntervalTrigger(minutes=5),
+        id="watch_checker",
+        name="Watch Checker",
         replace_existing=True,
         max_instances=1,
     )

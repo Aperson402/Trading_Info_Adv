@@ -289,6 +289,8 @@ async def fetch_state_dept(session: aiohttp.ClientSession) -> list[dict]:
     page_url = "https://www.state.gov/press-releases/"
 
     text = await _fetch_text(session, page_url)
+    if not text:
+        return []
 
     soup = BeautifulSoup(text, "html.parser")
     new_items: list[dict] = []

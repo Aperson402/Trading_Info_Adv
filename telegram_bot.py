@@ -396,12 +396,13 @@ async def send_calendar(events: list[dict]) -> None:
     await _send(bot, message)
 
 
-async def send_drill(instrument: str, drill_text: str) -> None:
+async def send_drill(instrument: str, drill_text: str, timeframe: str = "") -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     bot = Bot(token=TELEGRAM_TOKEN)
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    header = f"🔬 <b>DRILL — {instrument.upper()} — {_h(now_str)}</b>"
+    tf_tag  = f" [{_h(timeframe.upper())}]" if timeframe else ""
+    header  = f"🔬 <b>DRILL — {instrument.upper()}{tf_tag} — {_h(now_str)}</b>"
     message = f"{header}\n\n{_h(drill_text)}"
     await _send(bot, message)
 
@@ -468,6 +469,65 @@ async def send_signal_stats(stats: dict) -> None:
             ts    = (sig.get("recorded_at") or "")[:16].replace("T", " ")
             lines.append(f"{emoji}{dem} <b>{dirn.upper()}</b> @ ${entry:,.2f}  {c2}{c4}  <i>{_h(src)} {_h(ts)}</i>")
 
+    await _send(bot, "\n".join(lines))
+
+
+async def send_watch_update(watch: dict, status: str) -> None:
+    """Periodic check-in — condition not yet met."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    emoji = "🛢" if watch["instrument"] == "oil" else "🥇"
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    expires = datetime.fromisoformat(watch["expires_at"]).replace(tzinfo=timezone.utc)
+    mins_left = int((expires - datetime.now(timezone.utc)).total_seconds() / 60)
+    message = (
+        f"🔭 <b>WATCH #{watch['id']} — {emoji} {watch['instrument'].upper()} — {_h(now_str)}</b>\n"
+        f"<i>{_h(watch['condition'])}</i>\n\n"
+        f"Status: {_h(status)}\n"
+        f"Next check: {watch['check_interval']}min  |  Expires in: {mins_left}min"
+    )
+    await _send(bot, message)
+
+
+async def send_watch_triggered(watch: dict, reason: str) -> None:
+    """Condition met — fire the alert."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    emoji = "🛢" if watch["instrument"] == "oil" else "🥇"
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    message = (
+        f"🚨 <b>WATCH TRIGGERED #{watch['id']} — {emoji} {watch['instrument'].upper()} — {_h(now_str)}</b>\n"
+        f"<i>{_h(watch['condition'])}</i>\n\n"
+        f"{_h(reason)}\n\n"
+        f"Run /drill {watch['instrument']} for a fresh analysis."
+    )
+    await _send(bot, message)
+
+
+async def send_watches_list(watches: list[dict]) -> None:
+    """Show all active watches."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [f"🔭 <b>ACTIVE WATCHES — {_h(now_str)}</b>\n"]
+    if not watches:
+        lines.append("<i>No active watches. Run /drill oil or /drill gold to set one.</i>")
+    else:
+        now = datetime.now(timezone.utc)
+        for w in watches:
+            emoji = "🛢" if w["instrument"] == "oil" else "🥇"
+            expires = datetime.fromisoformat(w["expires_at"]).replace(tzinfo=timezone.utc)
+            mins_left = int((expires - now).total_seconds() / 60)
+            next_chk  = datetime.fromisoformat(w["next_check_at"]).replace(tzinfo=timezone.utc)
+            mins_next = max(0, int((next_chk - now).total_seconds() / 60))
+            lines.append(
+                f"{emoji} <b>#{w['id']}</b>  every {w['check_interval']}min  "
+                f"expires in {mins_left}min  next check in {mins_next}min\n"
+                f"  <i>{_h(w['condition'])}</i>"
+            )
     await _send(bot, "\n".join(lines))
 
 

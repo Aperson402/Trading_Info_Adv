@@ -25,7 +25,7 @@ import anthropic
 logger = logging.getLogger(__name__)
 SONNET_MODEL = "claude-sonnet-4-6"
 
-# ── Tool definition ───────────────────────────────────────────────────────────
+# ── Tool definitions ──────────────────────────────────────────────────────────
 
 FETCH_TOOL = {
     "name": "fetch_market_data",
@@ -85,7 +85,211 @@ FETCH_TOOL = {
     },
 }
 
+SPREAD_TOOL = {
+    "name": "compute_spread_ratio",
+    "description": (
+        "Fetch two Yahoo Finance tickers and compute their ratio (A÷B) or spread (A−B), "
+        "returning the current value, 20-period mean, standard deviation, and z-score. "
+        "Use for: Brent/WTI spread (BZ=F minus CL=F), gold/silver ratio (GC=F ÷ SI=F), "
+        "GLD/GDX ratio (ETF premium vs miners), oil/natgas ratio (CL=F ÷ NG=F), "
+        "WTI/Brent arb, or any pair where the relationship matters more than absolute price."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "ticker_a": {
+                "type": "string",
+                "description": "Numerator ticker (ratio mode) or minuend (difference mode).",
+            },
+            "ticker_b": {
+                "type": "string",
+                "description": "Denominator ticker (ratio mode) or subtrahend (difference mode).",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["ratio", "difference"],
+                "description": "ratio = A÷B  |  difference = A−B",
+            },
+            "interval": {
+                "type": "string",
+                "enum": ["1h", "4h", "1d"],
+                "description": "Bar interval.",
+            },
+            "period": {
+                "type": "string",
+                "enum": ["5d", "1mo", "3mo"],
+                "description": "Lookback period.",
+            },
+            "label": {
+                "type": "string",
+                "description": "Human-readable name shown in results (e.g. 'Brent-WTI spread').",
+            },
+        },
+        "required": ["ticker_a", "ticker_b", "mode", "interval", "period", "label"],
+    },
+}
+
+VOL_TOOL = {
+    "name": "fetch_implied_volatility",
+    "description": (
+        "Fetch commodity implied-volatility indices from Yahoo Finance. "
+        "^OVX = crude oil volatility index (CBOE); "
+        "^GVZ = gold volatility index (CBOE); "
+        "^VIX = equity volatility / risk-off proxy. "
+        "Returns current level, 30-day percentile rank, 5-day change, "
+        "and implied daily price move (price × vol ÷ √252) when a reference price is supplied. "
+        "Use to gauge whether options markets are pricing in a breakout or expecting calm — "
+        "high OVX/GVZ percentile = market expects a large move."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "indices": {
+                "type": "array",
+                "description": "Volatility indices to fetch. ^OVX for oil, ^GVZ for gold, ^VIX for risk-off.",
+                "items": {
+                    "type": "string",
+                    "enum": ["^OVX", "^GVZ", "^VIX"],
+                },
+                "minItems": 1,
+            },
+            "reference_price": {
+                "type": "number",
+                "description": (
+                    "Current instrument price used to compute implied daily move. "
+                    "Pass the live WTI or gold price so the output is actionable. Optional."
+                ),
+            },
+        },
+        "required": ["indices"],
+    },
+}
+
+ORDER_BOOK_TOOL = {
+    "name": "fetch_order_book",
+    "description": (
+        "Fetch a live Level 2 order book snapshot from Interactive Brokers "
+        "for the front-month WTI (CL/NYMEX) or Gold (GC/COMEX) futures contract. "
+        "Returns: best bid/ask and spread, total depth imbalance (bid vs ask lots), "
+        "identified walls (price levels with unusually large resting orders), "
+        "and the full depth table. "
+        "Use to identify where large resting orders are acting as support or resistance, "
+        "and whether order flow is skewed to buyers or sellers. "
+        "Requires IB Gateway or TWS to be running locally with API enabled."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "instrument": {
+                "type": "string",
+                "enum": ["oil", "gold"],
+                "description": "oil = CL (WTI) on NYMEX  |  gold = GC on COMEX",
+            },
+            "num_rows": {
+                "type": "integer",
+                "description": "Depth levels per side (1–5; capped by IBKR subscription tier).",
+                "minimum": 1,
+                "maximum": 5,
+                "default": 5,
+            },
+        },
+        "required": ["instrument"],
+    },
+}
+
+SET_WATCH_TOOL = {
+    "name": "set_watch",
+    "description": (
+        "Register a specific condition to monitor with periodic automated updates. "
+        "Call this when your analysis identifies a concrete, observable condition that "
+        "hasn't resolved yet — a price level to break, an indicator crossover to happen, "
+        "a spread to reach a threshold. The system will check the condition every N minutes, "
+        "send a status update each time, and fire an alert when the condition is met. "
+        "Only call this if there is a real, specific thing to watch — not for vague conditions."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "condition": {
+                "type": "string",
+                "description": (
+                    "Precise, observable condition. Include exact numbers so the automated "
+                    "checker can evaluate it unambiguously. "
+                    "Examples: 'Price breaks above $73.20 with RSI > 52' — "
+                    "'Stochastic K crosses above D from below 25' — "
+                    "'Brent-WTI spread narrows below $1.50'"
+                ),
+            },
+            "check_interval_minutes": {
+                "type": "integer",
+                "enum": [15, 30, 60],
+                "description": "How often to check and send a status update.",
+            },
+            "expires_minutes": {
+                "type": "integer",
+                "enum": [60, 120, 240, 480],
+                "description": "Stop watching after this many minutes if the condition hasn't fired.",
+            },
+        },
+        "required": ["condition", "check_interval_minutes", "expires_minutes"],
+    },
+}
+
+ALL_TOOLS = [FETCH_TOOL, SPREAD_TOOL, VOL_TOOL, ORDER_BOOK_TOOL]
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
+
+# ── Timeframe focus hints ─────────────────────────────────────────────────────
+
+_TF_HINTS: dict[str, str] = {
+    "5m":  (
+        "TIMEFRAME FOCUS: 5-minute scalping. "
+        "Fetch 5m bars for today (period='1d'). Focus on micro-structure, momentum, "
+        "and immediate entry/exit levels within the next 15-30 minutes."
+    ),
+    "15m": (
+        "TIMEFRAME FOCUS: 15-minute intraday. "
+        "Fetch 15m bars for the last 1-2 days. Identify intraday trend direction, "
+        "key intraday levels, and whether the current candle structure confirms or reverses the bias."
+    ),
+    "30m": (
+        "TIMEFRAME FOCUS: 30-minute swing. "
+        "Fetch 30m bars for the last 2-5 days. Identify the intraday swing structure, "
+        "momentum continuation vs. reversal, and optimal entry timing."
+    ),
+    "2h":  (
+        "TIMEFRAME FOCUS: Last 2 hours of price action. "
+        "Fetch 15m bars for today. Analyse what specifically happened in the last 2 hours — "
+        "the developing micro-trend, recent high/low, and whether momentum is building or fading."
+    ),
+    "4h":  (
+        "TIMEFRAME FOCUS: 4-hour swing structure. "
+        "Fetch 4H bars for the last 30 days. Identify the current swing trend, key 4H levels, "
+        "and whether the setup is a trend continuation or potential reversal."
+    ),
+    "1d":  (
+        "TIMEFRAME FOCUS: Daily chart macro perspective. "
+        "Fetch 1d bars for the last 3 months. Identify the macro trend, daily key levels, "
+        "and where this instrument sits in the broader picture."
+    ),
+    "1w":  (
+        "TIMEFRAME FOCUS: Weekly macro context. "
+        "Fetch weekly bars for 1-2 years. Identify long-term trend, major support/resistance, "
+        "and whether price is at a historically significant level."
+    ),
+    "overnight": (
+        "TIMEFRAME FOCUS: Overnight session (yesterday's close → now). "
+        "Fetch 15m bars for the last 2 days. Determine: what happened while markets were thin, "
+        "whether there are unfilled gaps, significant overnight moves or news spikes, "
+        "and what bias is established for the London open."
+    ),
+}
+
+def _timeframe_focus(timeframe: str) -> str:
+    """Return the prompt hint for the requested timeframe, or empty string for default 1H."""
+    hint = _TF_HINTS.get(timeframe.lower() if timeframe else "")
+    return f"\n{hint}\n" if hint else ""
+
 
 PHASE1_PROMPT = """\
 You are assessing a WAIT signal on {instrument_upper}. This is a two-stage process.
@@ -95,7 +299,7 @@ Be intentional. Request the exact tickers and timeframes that would tell you whe
 the blocking conditions are about to resolve — not generic data.
 
 STAGE 2 (after data): Produce a tight CONDITION CHECK with probability.
-
+{timeframe_focus}
 ── CURRENT STATE ────────────────────────────────────────────────────────────────
 
 TIME: {now} UTC
@@ -125,7 +329,15 @@ RECENT NEWS ({n_items} items, last 4h):
 EVENTS NEXT 4H: {upcoming_events}
 
 ────────────────────────────────────────────────────────────────────────────────
-Call fetch_market_data now with what you need.\
+AVAILABLE TOOLS (call any combination in parallel):
+• fetch_market_data        — OHLCV for any Yahoo Finance ticker (correlated assets, ETFs, FX, bonds)
+• compute_spread_ratio     — ratio or spread between two tickers with z-score context
+                             (e.g. Brent−WTI spread, Gold/Silver ratio, GLD÷GDX, Oil÷Natgas)
+• fetch_implied_volatility — ^OVX / ^GVZ / ^VIX with 30-day percentile rank and implied daily move
+• fetch_order_book         — live IB Level 2 depth: bid/ask walls, spread, order imbalance
+                             (oil = CL NYMEX, gold = GC COMEX; requires IB Gateway running)
+
+Call the tools you need now. Be intentional — choose what actually resolves your uncertainty.\
 """
 
 PHASE2_INSTRUCTION = """\
@@ -147,7 +359,12 @@ Cite specific news items, data points, or macro flows. Two sentences max.]
 
 WATCH NOW:
 • [Most important specific level or signal to monitor, with exact number]
-• [Second most important thing]\
+• [Second most important thing]
+
+After writing the analysis, if there is a specific, concrete condition worth monitoring
+(a price level, crossover, or threshold not yet reached), call set_watch with the exact
+condition, how often to check, and when to stop. Only call it if there is a real trigger
+to watch — skip if the situation is already clear or has no actionable wait condition.\
 """
 
 
@@ -253,6 +470,128 @@ async def _fetch_all(requests: list[dict]) -> str:
     return "\n\n".join(sections)
 
 
+# ── Spread and vol fetchers ───────────────────────────────────────────────────
+
+async def _run_spread(inp: dict) -> str:
+    """Fetch two tickers concurrently and compute spread or ratio with z-score."""
+    loop = asyncio.get_event_loop()
+    ticker_a = inp["ticker_a"]
+    ticker_b = inp["ticker_b"]
+    mode     = inp["mode"]
+    interval = inp["interval"]
+    period   = inp["period"]
+    label    = inp["label"]
+
+    df_a, df_b = await asyncio.gather(
+        loop.run_in_executor(None, _fetch_one_sync, ticker_a, interval, period),
+        loop.run_in_executor(None, _fetch_one_sync, ticker_b, interval, period),
+    )
+
+    if df_a is None or df_b is None:
+        missing = ticker_a if df_a is None else ticker_b
+        return f"[{label}]: fetch failed for {missing}"
+
+    ca = df_a["Close"].squeeze()
+    cb = df_b["Close"].squeeze()
+    aligned = pd.DataFrame({"a": ca, "b": cb}).dropna()
+    if len(aligned) < 5:
+        return f"[{label}]: insufficient overlapping data ({len(aligned)} bars)"
+
+    series = aligned["a"] / aligned["b"] if mode == "ratio" else aligned["a"] - aligned["b"]
+
+    last   = float(series.iloc[-1])
+    n      = min(20, len(series))
+    mean_n = float(series.rolling(n).mean().iloc[-1])
+    std_n  = float(series.rolling(n).std().iloc[-1])
+    zscore = (last - mean_n) / std_n if std_n > 0 else 0.0
+
+    prev   = float(series.iloc[-2]) if len(series) >= 2 else last
+    trend  = "widening" if last > prev else "narrowing"
+
+    z_note = (
+        "EXTREME HIGH" if zscore >  2.0 else
+        "HIGH"         if zscore >  1.0 else
+        "EXTREME LOW"  if zscore < -2.0 else
+        "LOW"          if zscore < -1.0 else
+        "normal range"
+    )
+
+    n_show   = min(12, len(series))
+    bars_str = " → ".join(f"{float(x):.4f}" for x in series.iloc[-n_show:].tolist())
+
+    return (
+        f"[{label}] {ticker_a} {mode} {ticker_b} @ {interval}  →  {last:.4f}\n"
+        f"  {n}-bar mean: {mean_n:.4f}  |  z-score: {zscore:+.2f} ({z_note})  |  {trend}\n"
+        f"  bars: {bars_str}"
+    )
+
+
+def _fetch_vol_one_sync(ticker: str, ref_price: float = None) -> str:
+    """Sync fetch for a single vol index."""
+    label_map = {"^OVX": "OVX (Crude Oil Vol)", "^GVZ": "GVZ (Gold Vol)", "^VIX": "VIX (Equity Vol)"}
+    label = label_map.get(ticker, ticker)
+    try:
+        df = yf.download(ticker, period="1mo", interval="1d", progress=False, auto_adjust=True)
+        if df.empty:
+            return f"[{label}]: no data"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        c    = df["Close"].squeeze()
+        last = float(c.iloc[-1])
+
+        prev5 = float(c.iloc[-6]) if len(c) >= 6 else float(c.iloc[0])
+        chg5d = (last - prev5) / prev5 * 100 if prev5 else 0.0
+
+        pct_rank = float((c <= last).mean() * 100)
+
+        implied = ""
+        if ref_price:
+            daily_move = ref_price * (last / 100) / (252 ** 0.5)
+            implied = f"  |  implied daily move: ±${daily_move:.2f}"
+
+        trend = "rising" if chg5d > 1 else "falling" if chg5d < -1 else "flat"
+        return (
+            f"[{label}] {last:.2f}  ({chg5d:+.1f}% last 5d, {trend})  "
+            f"30d percentile: {pct_rank:.0f}th{implied}"
+        )
+    except Exception as exc:
+        return f"[{label}]: error — {exc}"
+
+
+async def _run_vol(inp: dict, instrument_price: float = None) -> str:
+    """Fetch multiple vol indices concurrently."""
+    loop      = asyncio.get_event_loop()
+    indices   = inp.get("indices", [])
+    ref_price = inp.get("reference_price") or instrument_price
+    results   = await asyncio.gather(
+        *[loop.run_in_executor(None, _fetch_vol_one_sync, ticker, ref_price) for ticker in indices]
+    )
+    return "\n".join(results)
+
+
+async def _dispatch_tool_calls(tool_blocks: list, instrument_price: float = None,
+                               instrument: str = "") -> list[str]:
+    """Run all tool calls from phase-1 concurrently; return result strings in same order."""
+    from ib_orderbook import fetch_order_book
+
+    async def _one(tb) -> str:
+        name = tb.name
+        inp  = tb.input
+        if name == "fetch_market_data":
+            return await _fetch_all(inp.get("requests", []))
+        if name == "compute_spread_ratio":
+            return await _run_spread(inp)
+        if name == "fetch_implied_volatility":
+            return await _run_vol(inp, instrument_price)
+        if name == "fetch_order_book":
+            inst     = inp.get("instrument") or instrument
+            num_rows = inp.get("num_rows", 5)
+            return await fetch_order_book(inst, num_rows)
+        return f"Unknown tool: {name}"
+
+    return list(await asyncio.gather(*[_one(tb) for tb in tool_blocks]))
+
+
 # ── Prompt helpers ────────────────────────────────────────────────────────────
 
 def _fmt_silver_section(corr: dict) -> str:
@@ -347,7 +686,7 @@ def _fmt_upcoming(calendar_events: list) -> str:
 
 
 def _build_phase1(instrument, ctx, dxy_ctx, corr, items, calendar_events,
-                  fred_ctx=None, oil_curve=None, gld_flow=None) -> str:
+                  fred_ctx=None, oil_curve=None, gld_flow=None, timeframe: str = "") -> str:
     def g(d, k, default="n/a"):
         v = (d or {}).get(k, default)
         return v if v is not None else default
@@ -358,6 +697,7 @@ def _build_phase1(instrument, ctx, dxy_ctx, corr, items, calendar_events,
 
     return PHASE1_PROMPT.format(
         instrument_upper=instrument.upper(),
+        timeframe_focus=_timeframe_focus(timeframe),
         now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
         price=g(ctx, "price"),
         upper=g(ctx, "upper"),
@@ -411,20 +751,22 @@ async def generate_drill(
     fred_ctx: dict = None,
     oil_curve: dict = None,
     gld_flow: dict = None,
+    timeframe: str = "",
 ) -> str:
     client        = anthropic.AsyncAnthropic()
     phase1_prompt = _build_phase1(
         instrument, ctx, dxy_ctx, corr, items, calendar_events or [],
         fred_ctx=fred_ctx, oil_curve=oil_curve, gld_flow=gld_flow,
+        timeframe=timeframe,
     )
     messages      = [{"role": "user", "content": phase1_prompt}]
 
-    # Phase 1 — Claude declares what it needs
+    # Phase 1 — Claude declares what it needs (may call multiple tools)
     try:
         resp1 = await client.messages.create(
             model=SONNET_MODEL,
-            max_tokens=600,
-            tools=[FETCH_TOOL],
+            max_tokens=700,
+            tools=ALL_TOOLS,
             tool_choice={"type": "any"},  # force at least one tool call
             messages=messages,
         )
@@ -437,23 +779,17 @@ async def generate_drill(
         logger.warning("Drill: Claude returned no tool call")
         return ""
 
-    # Phase 2 — fetch all requested data in parallel
-    all_requests = []
-    for tb in tool_blocks:
-        all_requests.extend(tb.input.get("requests", []))
+    tool_names = [tb.name for tb in tool_blocks]
+    logger.info("Drill [%s]: %d tool call(s): %s", instrument, len(tool_blocks), tool_names)
 
-    logger.info(
-        "Drill [%s]: fetching %d dataset(s): %s",
-        instrument,
-        len(all_requests),
-        ", ".join(f"{r['label']}@{r['interval']}" for r in all_requests[:6]),
-    )
-    fetched_str = await _fetch_all(all_requests)
+    # Phase 2 — execute all tool calls concurrently
+    instrument_price = ctx.get("price")
+    results = await _dispatch_tool_calls(tool_blocks, instrument_price, instrument)
 
     # Phase 3 — give Claude the results, get the analysis
     tool_results = [
-        {"type": "tool_result", "tool_use_id": tb.id, "content": fetched_str}
-        for tb in tool_blocks
+        {"type": "tool_result", "tool_use_id": tb.id, "content": result}
+        for tb, result in zip(tool_blocks, results)
     ]
     messages = messages + [
         {"role": "assistant", "content": resp1.content},
@@ -463,13 +799,45 @@ async def generate_drill(
     try:
         resp2 = await client.messages.create(
             model=SONNET_MODEL,
-            max_tokens=450,
+            max_tokens=600,
+            tools=[SET_WATCH_TOOL],
+            tool_choice={"type": "auto"},
             messages=messages,
         )
-        text = resp2.content[0].text.strip()
+
+        # Extract text analysis and any set_watch calls
+        text = ""
+        watch_inp = None
+        for block in resp2.content:
+            if block.type == "text":
+                text += block.text
+            elif block.type == "tool_use" and block.name == "set_watch":
+                watch_inp = block.input
+        text = text.strip()
+
+        # Create the watch if Claude requested one
+        if watch_inp:
+            from database import create_watch
+            watch_id = await create_watch(
+                instrument=instrument,
+                condition=watch_inp["condition"],
+                check_interval=watch_inp["check_interval_minutes"],
+                expires_minutes=watch_inp["expires_minutes"],
+            )
+            interval = watch_inp["check_interval_minutes"]
+            expires  = watch_inp["expires_minutes"]
+            text += (
+                f"\n\n🔭 Watch #{watch_id} set — checking every {interval}min "
+                f"for up to {expires}min:\n{watch_inp['condition']}"
+            )
+            logger.info(
+                "Watch #%d created [%s] every %dmin/%dmin: %s",
+                watch_id, instrument, interval, expires, watch_inp["condition"][:80],
+            )
+
         logger.info(
-            "Drill [%s] complete — %d dataset(s) fetched, %d chars output",
-            instrument, len(all_requests), len(text),
+            "Drill [%s] complete — %d tool call(s), %d chars output",
+            instrument, len(tool_blocks), len(text),
         )
         return text
     except Exception as exc:
